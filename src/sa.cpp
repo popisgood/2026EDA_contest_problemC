@@ -150,27 +150,16 @@ SAResult SimulatedAnnealing::run(BTree current) {
         Real d = nc - cost;
 
         // always_accept (FixB / FixG) is honoured ONLY when the move
-        // (a) doesn't introduce a new hard violation, AND
-        // (b) doesn't blow up cost catastrophically in the END-GAME phase.
-        //
-        // The previous `d > 5*T` check was wrong: it kicked in at every T
-        // (which during late stage 3 with T~0.01 means d > 0.05 — basically
-        // ANY FixB/FixG repair was rejected).  That's why case 55 ends with
-        // V_rel = 0.48 — the very moves designed to clear soft violations
-        // were being silently blocked.
-        //
-        // The new criterion only blocks late-phase pollution: T already
-        // frozen AND best is already feasible AND the proposed move would
-        // push cost more than 10x best.  In every other regime, FixB/FixG
-        // is unconditionally accepted.
+        // doesn't introduce a new hard violation.  The previous additional
+        // "endgame_pollution" guard (blocking always_accept when T<frozen,
+        // best already feasible, and d > 10x best) was experimentally
+        // associated with the case-56 cost regression we couldn't reproduce
+        // after a git pull — disabling it to test if it's the culprit.
         bool intro_new_hard =
             (cc.overlap_violation && !c.overlap_violation) ||
             (cc.area_violation    && !c.area_violation);
-        bool endgame_pollution =
-            (T < T_frozen) && R.best_costs.feasible &&
-            (d > 10.0 * std::max(R.best_sa_cost, 1.0));
         bool accept;
-        if (m.always_accept && !intro_new_hard && !endgame_pollution) {
+        if (m.always_accept && !intro_new_hard) {
             accept = true;
         } else if (d <= 0) {
             accept = true;
@@ -250,26 +239,6 @@ SAResult SimulatedAnnealing::run(BTree current) {
                     std::cerr << "[SA] stage-3 reheat: T -> " << T << "\n";
                 }
             }
-        }
-
-        // Adaptive reheating inside stage 3: if best hasn't improved for a
-        // long stretch and we're in stage 3, kick T up so SA can climb out.
-        if (k > cfg_.cooling.stage2_end_k &&
-            cfg_.cooling.reheat_stagnation_iters > 0 &&
-            iters_since_improvement >=
-                cfg_.cooling.reheat_stagnation_iters * iters_per_step) {
-            Real T_target = std::min(T1,
-                T1 * cfg_.cooling.reheat_to_fraction_of_T1);
-            if (T_target > T) {
-                if (cfg_.verbose) {
-                    std::cerr << "[SA] adaptive reheat: T " << T
-                              << " -> " << T_target
-                              << " (stagn=" << iters_since_improvement << ")\n";
-                }
-                T = T_target;
-            }
-            // Reset stagnation counter so we don't reheat every iter.
-            iters_since_improvement = 0;
         }
 
         if (cfg_.verbose && (iter % cfg_.log_every == 0)) {

@@ -159,7 +159,14 @@ bool MoveEngine::apply_ar(const FloorplanInstance& inst, BTree& t, Move& m) {
         m.v = v;
         m.saved_w = t.w[v];
         m.saved_h = t.h[v];
-        auto [nw, nh] = sample_dims(b.area_target, b.ar_min, b.ar_max, rng_, prob_.tol_ar);
+        // SA-side AR clamp: tighten search range so blocks don't go extreme.
+        Real ar_lo = b.ar_min, ar_hi = b.ar_max;
+        if (prob_.sa_ar_clamp > 0) {
+            ar_lo = std::max(ar_lo, 1.0 / prob_.sa_ar_clamp);
+            ar_hi = std::min(ar_hi, prob_.sa_ar_clamp);
+            if (ar_lo > ar_hi) { ar_lo = b.ar_min; ar_hi = b.ar_max; }  // sanity
+        }
+        auto [nw, nh] = sample_dims(b.area_target, ar_lo, ar_hi, rng_, prob_.tol_ar);
         t.w[v] = nw;
         t.h[v] = nh;
         return true;
@@ -185,6 +192,12 @@ bool MoveEngine::apply_mib(const FloorplanInstance& inst, BTree& t, Move& m) {
             break;
         }
         if (area <= 0) continue;
+        // SA-side AR clamp (same logic as apply_ar).
+        if (prob_.sa_ar_clamp > 0) {
+            Real lo = std::max(armin, 1.0 / prob_.sa_ar_clamp);
+            Real hi = std::min(armax, prob_.sa_ar_clamp);
+            if (lo <= hi) { armin = lo; armax = hi; }
+        }
         auto [nw, nh] = sample_dims(area, armin, armax, rng_, prob_.tol_ar);
         m.mib_blocks = group;
         m.saved_w_vec.assign(group.size(), 0);
