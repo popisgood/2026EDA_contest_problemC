@@ -79,76 +79,6 @@ inline bool rect_overlap(Real ax, Real ay, Real aw, Real ah,
 
 } // namespace
 
-// Slide every non-preplaced block as far left and down as it will go
-// without overlapping its neighbours or going below (0,0).  This is the
-// standard "B*-tree post-pack compaction" — it does NOT change the topology,
-// only the realised (x,y), so SA invariants are preserved (the next move
-// will repack from scratch).
-//
-// Why we compact ALL non-preplaced blocks (including boundary-pinned ones):
-//   An earlier version skipped E_TOP/E_RIGHT blocks here in the hope of
-//   preserving the boundary constraint.  Result: those blocks stayed at
-//   whatever (high) y the contour packer placed them at, forcing a tall
-//   bbox with everything else compacted below.  Net: huge dead space, the
-//   bbox aspect went the WRONG way.
-//   Now we compact everyone.  If a boundary constraint is temporarily
-//   violated, SA's cost function (w_bound term) tells SA to use a
-//   FixBoundary move to put the block back at the edge.  This converges
-//   to both compact AND feasible far more often than the skip-approach.
-//
-//   preplaced is still skipped because its (x,y) is HARD-locked: any
-//   deviation = hard-constraint violation = contest_cost = 10.
-static void compact_left_down(const FloorplanInstance& inst, BTree& tree) {
-    const int n = (int)tree.nodes.size();
-
-    auto compact_axis_x = [&](int i) {
-        if (inst.blocks[i].is_preplaced) return;
-        Real best_x = 0.0;
-        Real ay = tree.y[i], ah = tree.h[i];
-        for (int j = 0; j < n; ++j) {
-            if (j == i) continue;
-            Real by = tree.y[j], bh = tree.h[j];
-            // y overlap (strict)?
-            if (ay + 1e-9 >= by + bh) continue;
-            if (by + 1e-9 >= ay + ah) continue;
-            // j's right edge as a candidate
-            Real candidate = tree.x[j] + tree.w[j];
-            if (candidate <= tree.x[i] + 1e-9 && candidate > best_x) best_x = candidate;
-        }
-        // Don't move it further than it currently is (only shrink, never grow).
-        if (best_x < tree.x[i] - 1e-9) tree.x[i] = best_x;
-    };
-    auto compact_axis_y = [&](int i) {
-        if (inst.blocks[i].is_preplaced) return;
-        Real best_y = 0.0;
-        Real ax = tree.x[i], aw = tree.w[i];
-        for (int j = 0; j < n; ++j) {
-            if (j == i) continue;
-            Real bx = tree.x[j], bw = tree.w[j];
-            if (ax + 1e-9 >= bx + bw) continue;
-            if (bx + 1e-9 >= ax + aw) continue;
-            Real candidate = tree.y[j] + tree.h[j];
-            if (candidate <= tree.y[i] + 1e-9 && candidate > best_y) best_y = candidate;
-        }
-        if (best_y < tree.y[i] - 1e-9) tree.y[i] = best_y;
-    };
-
-    // Two passes of (sort-by-y then compact-down) then (sort-by-x then
-    // compact-left) — order matters because compacting one block can free up
-    // space for another.  Three iterations is empirically a fixpoint at
-    // n ≤ 200 (and even one iteration removes most of the gross dead space).
-    std::vector<int> idx(n);
-    for (int i = 0; i < n; ++i) idx[i] = i;
-    for (int pass = 0; pass < 3; ++pass) {
-        // bottom-up: blocks with smaller y get pulled down first
-        std::sort(idx.begin(), idx.end(), [&](int a, int b){ return tree.y[a] < tree.y[b]; });
-        for (int i : idx) compact_axis_y(i);
-        // left-first: blocks with smaller x get pulled left first
-        std::sort(idx.begin(), idx.end(), [&](int a, int b){ return tree.x[a] < tree.x[b]; });
-        for (int i : idx) compact_axis_x(i);
-    }
-}
-
 PackResult Packer::pack(const FloorplanInstance& inst, BTree& tree) const {
     PackResult result;
     const int n = static_cast<int>(tree.nodes.size());
@@ -226,21 +156,6 @@ PackResult Packer::pack(const FloorplanInstance& inst, BTree& tree) const {
         } else {
             st.pop();
         }
-    }
-
-    // ---- Post-pack compaction ------------------------------------------
-    // Slide every non-anchored, non-right/top-pinned block as far left and
-    // down as it will go.  This eliminates the fragmented-whitespace holes
-    // that the contour packer naturally produces but the topology moves
-    // cannot close.
-    compact_left_down(inst, tree);
-
-    // Re-compute the bbox after compaction (it can only shrink).
-    bbox_w_max = 0.0;
-    bbox_h_max = 0.0;
-    for (int i = 0; i < n; ++i) {
-        bbox_w_max = std::max(bbox_w_max, tree.x[i] + tree.w[i]);
-        bbox_h_max = std::max(bbox_h_max, tree.y[i] + tree.h[i]);
     }
 
     // Post-pass overlap check just for anchored vs. anything: tree-vs-tree
