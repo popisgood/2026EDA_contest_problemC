@@ -154,16 +154,41 @@ def _write_txt(
         for b in group:
             block_to_cluster_ordinal[b] = ord_
 
+    # ---- Baseline estimation ------------------------------------------------
+    #
+    # The C++ solver normalises area / HPWL by these baselines so that SA's
+    # sa_cost stays in a reasonable scale (~1-10 per term).  Without them
+    # cost.cpp falls back to abase = hbase = 1.0 and raw area_bbox (~50000)
+    # dominates -- T1 calibrates to ~50000 instead of ~5, and Metropolis's
+    # exp(-Δ/T) collapses to ~1 (SA accepts everything = random walk).
+    #
+    # Heuristics:
+    #   baseline_area = sum(block_area) * 1.10  (10% whitespace headroom)
+    #   baseline_hpwl = total_net_weight * (sqrt(area) * 0.5)
+    #                   (assume each net spans ~half the bbox side)
+    total_area = float(area_targets[:block_count].sum().item()) if block_count > 0 else 0.0
+    baseline_area = total_area * 1.10 if total_area > 0 else 1.0
+
+    side = math.sqrt(baseline_area) if baseline_area > 0 else 1.0
+    avg_edge = side * 0.5
+
+    total_net_weight = 0.0
+    if valid_b2b is not None and valid_b2b.numel() > 0:
+        total_net_weight += float(valid_b2b[:, 2].sum().item())
+    if valid_p2b is not None and valid_p2b.numel() > 0:
+        total_net_weight += float(valid_p2b[:, 2].sum().item())
+    baseline_hpwl = (total_net_weight * avg_edge) if total_net_weight > 0 else side
+
     with open(out_path, "w") as f:
         f.write("# emitted by my_optimizer.py for the ICCAD 2026 contest\n")
         f.write(f"N_BLOCKS    {block_count}\n")
         f.write(f"N_TERMINALS {n_pins}\n")
-        # The framework computes its own baselines from ground truth.
-        # Our solver only uses BASELINE_HPWL/BASELINE_AREA for its internal
-        # cost shaping — leaving them at 0 is fine; the SA still optimises
-        # the right things.
-        f.write("BASELINE_HPWL 0.0\n")
-        f.write("BASELINE_AREA 0.0\n")
+        # Baselines: the framework computes its OWN baselines from ground
+        # truth for the final contest_cost score, so the values here ONLY
+        # affect the solver's internal SA cost function (which needs them
+        # to keep magnitudes in a sane scale -- see comment above).
+        f.write(f"BASELINE_HPWL {baseline_hpwl:.6f}\n")
+        f.write(f"BASELINE_AREA {baseline_area:.6f}\n")
         f.write("OUTLINE 0.0 0.0\n")
 
         if n_pins > 0:
