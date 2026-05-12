@@ -315,7 +315,7 @@ class MyOptimizer(FloorplanOptimizer):
             self.binary = cand if cand.exists() else Path("./floorplanner").resolve()
 
         self.threads = int(os.environ.get("FLOORPLANNER_THREADS", "8"))
-        self.time_expr = os.environ.get("FLOORPLANNER_TIME", "5+0.5*n")
+        self.time_expr = os.environ.get("FLOORPLANNER_TIME", "8+1.0*n")
         self.seed = int(os.environ.get("FLOORPLANNER_SEED", "1"))
         self.keep = os.environ.get("FLOORPLANNER_KEEP", "0") == "1"
 
@@ -348,7 +348,7 @@ class MyOptimizer(FloorplanOptimizer):
         try:
             time_s = float(eval(self.time_expr, {"__builtins__": {}}, {"n": block_count}))
         except Exception:
-            time_s = 5.0 + 0.5 * block_count
+            time_s = 8.0 + 1.0 * block_count
         time_s = max(1.0, min(time_s, 300.0))
 
         idx = self._call_idx
