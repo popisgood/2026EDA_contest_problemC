@@ -83,7 +83,7 @@ struct SAWeights {
 
     Real w_overlap  = 5000.0;  // huge -- overlap is hard
     Real w_softarea = 5000.0;  // huge -- soft-block area-tolerance is hard
-    Real w_group    = 80.0;    // grouping  (was 5; contest cost is exponential in V_rel)
+    Real w_group    = 300.0;    // grouping  (was 5; contest cost is exponential in V_rel)
     Real w_mib      = 80.0;    // MIB
     Real w_bound    = 80.0;    // boundary
 

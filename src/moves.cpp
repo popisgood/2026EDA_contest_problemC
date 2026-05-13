@@ -282,6 +282,15 @@ bool MoveEngine::apply_fixb(const FloorplanInstance& inst, BTree& t, Move& m,
 
     // Tactic 2: move v to be the right-child of any constrained block already
     // at edge e (this anchors it on the edge in the next packing).
+    //
+    // We DON'T set always_accept = true here.  Tactic 2 forces v to be a
+    // child of a block already at the bbox edge, which in a B*-tree pushes
+    // v into a position governed by the parent's coordinates.  When the
+    // parent is, say, at the bbox-RIGHT edge near the top of the floorplan,
+    // making v its right-child stacks v even higher up — that's the exact
+    // mechanism that produced the staircase / "blocks float upward" artifact
+    // we observed on case 55.  Letting Metropolis decide whether to keep this
+    // move means SA only commits to it when the overall floorplan benefits.
     std::vector<int> anchors;
     for (int j = 0; j < n; ++j) {
         if (j == v) continue;
@@ -290,9 +299,6 @@ bool MoveEngine::apply_fixb(const FloorplanInstance& inst, BTree& t, Move& m,
     if (anchors.empty()) return false;
     int u = anchors[rand_int(rng_, 0, (int)anchors.size() - 1)];
     bool as_left;
-    // For LEFT/BOTTOM edges, the block needs the leftmost / bottom-most
-    // position; for RIGHT/TOP, picking right_child of an anchor pushes v away
-    // from the chosen edge.  This is heuristic -- it's just a hint.
     switch (e) {
         case E_LEFT: case C_BL: case C_TL:    as_left = false; break;
         case E_BOTTOM: case E_RIGHT: case C_BR: as_left = true;  break;
@@ -310,7 +316,8 @@ bool MoveEngine::apply_fixb(const FloorplanInstance& inst, BTree& t, Move& m,
     }
     m.saved_h_vec.assign(1, (Real)t.root);
     if (!t.op_move(v, u, as_left)) return false;
-    m.always_accept = true;
+    // m.always_accept = true;
+    // m.always_accept stays false — let Metropolis decide.
     return true;
 }
 
