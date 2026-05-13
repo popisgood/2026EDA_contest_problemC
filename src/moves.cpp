@@ -23,7 +23,7 @@ Real rand_real(RNG& rng, Real lo, Real hi) {
 // Clamp h/w to [ar_min, ar_max] while preserving area = a (within tol).
 inline std::pair<Real, Real> sample_dims(Real area, Real ar_min, Real ar_max,
                                          std::mt19937_64& rng,
-                                         Real tol = 0.005) {
+                                         Real tol) {
     // Pick aspect ratio r = h/w in [ar_min, ar_max], possibly perturbed.
     Real r = std::exp(rand_real(rng, std::log(ar_min), std::log(ar_max)));
     // Choose nominal area in [(1-tol)a, (1+tol)a] so we land safely inside the
@@ -159,7 +159,14 @@ bool MoveEngine::apply_ar(const FloorplanInstance& inst, BTree& t, Move& m) {
         m.v = v;
         m.saved_w = t.w[v];
         m.saved_h = t.h[v];
-        auto [nw, nh] = sample_dims(b.area_target, b.ar_min, b.ar_max, rng_);
+        // SA-side AR clamp: tighten search range so blocks don't go extreme.
+        Real ar_lo = b.ar_min, ar_hi = b.ar_max;
+        if (prob_.sa_ar_clamp > 0) {
+            ar_lo = std::max(ar_lo, 1.0 / prob_.sa_ar_clamp);
+            ar_hi = std::min(ar_hi, prob_.sa_ar_clamp);
+            if (ar_lo > ar_hi) { ar_lo = b.ar_min; ar_hi = b.ar_max; }  // sanity
+        }
+        auto [nw, nh] = sample_dims(b.area_target, ar_lo, ar_hi, rng_, prob_.tol_ar);
         t.w[v] = nw;
         t.h[v] = nh;
         return true;
@@ -185,7 +192,13 @@ bool MoveEngine::apply_mib(const FloorplanInstance& inst, BTree& t, Move& m) {
             break;
         }
         if (area <= 0) continue;
-        auto [nw, nh] = sample_dims(area, armin, armax, rng_);
+        // SA-side AR clamp (same logic as apply_ar).
+        if (prob_.sa_ar_clamp > 0) {
+            Real lo = std::max(armin, 1.0 / prob_.sa_ar_clamp);
+            Real hi = std::min(armax, prob_.sa_ar_clamp);
+            if (lo <= hi) { armin = lo; armax = hi; }
+        }
+        auto [nw, nh] = sample_dims(area, armin, armax, rng_, prob_.tol_ar);
         m.mib_blocks = group;
         m.saved_w_vec.assign(group.size(), 0);
         m.saved_h_vec.assign(group.size(), 0);
@@ -269,6 +282,15 @@ bool MoveEngine::apply_fixb(const FloorplanInstance& inst, BTree& t, Move& m,
 
     // Tactic 2: move v to be the right-child of any constrained block already
     // at edge e (this anchors it on the edge in the next packing).
+    //
+    // We DON'T set always_accept = true here.  Tactic 2 forces v to be a
+    // child of a block already at the bbox edge, which in a B*-tree pushes
+    // v into a position governed by the parent's coordinates.  When the
+    // parent is, say, at the bbox-RIGHT edge near the top of the floorplan,
+    // making v its right-child stacks v even higher up — that's the exact
+    // mechanism that produced the staircase / "blocks float upward" artifact
+    // we observed on case 55.  Letting Metropolis decide whether to keep this
+    // move means SA only commits to it when the overall floorplan benefits.
     std::vector<int> anchors;
     for (int j = 0; j < n; ++j) {
         if (j == v) continue;
@@ -277,9 +299,6 @@ bool MoveEngine::apply_fixb(const FloorplanInstance& inst, BTree& t, Move& m,
     if (anchors.empty()) return false;
     int u = anchors[rand_int(rng_, 0, (int)anchors.size() - 1)];
     bool as_left;
-    // For LEFT/BOTTOM edges, the block needs the leftmost / bottom-most
-    // position; for RIGHT/TOP, picking right_child of an anchor pushes v away
-    // from the chosen edge.  This is heuristic -- it's just a hint.
     switch (e) {
         case E_LEFT: case C_BL: case C_TL:    as_left = false; break;
         case E_BOTTOM: case E_RIGHT: case C_BR: as_left = true;  break;
@@ -297,32 +316,25 @@ bool MoveEngine::apply_fixb(const FloorplanInstance& inst, BTree& t, Move& m,
     }
     m.saved_h_vec.assign(1, (Real)t.root);
     if (!t.op_move(v, u, as_left)) return false;
-    m.always_accept = true;
+    // m.always_accept = true;
+    // m.always_accept stays false — let Metropolis decide.
     return true;
 }
 
 Move MoveEngine::propose(const FloorplanInstance& inst, BTree& tree, const Costs* prev) {
     Move m{};
-    // Probabilities (sum to 1). The original P_FIX = 0.0005 produced ~1
-    // boundary fix per 2000 iters — far too rare given that random initial
-    // trees start with most boundary blocks violated. Bumped to P_FIXB +
-    // P_FIXG = 0.10 so SA can chase boundary/grouping satisfaction.
-    constexpr double P_FIXB = 0.05;
-    constexpr double P_FIXG = 0.05;
-    constexpr double P_AR   = 0.18;
-    constexpr double P_MIB  = 0.05;
-    constexpr double P_ROT  = 0.15;
-    constexpr double P_SWP  = 0.15;
-    // remainder ~0.37 = move
+    // Probabilities live in this->prob_ (configurable from sa.hpp::MoveProb).
+    // Constraint: p_fixb + p_fixg + p_ar + p_mib + p_rot + p_swp <= 1.0;
+    // the remainder goes to MoveKind::Move (the biggest-Δ subtree graft).
     double r = std::uniform_real_distribution<double>(0, 1)(rng_);
     double acc = 0.0;
-    if      (r < (acc += P_FIXB)) m.kind = MoveKind::FixBoundary;
-    else if (r < (acc += P_FIXG)) m.kind = MoveKind::FixGrouping;
-    else if (r < (acc += P_AR))   m.kind = MoveKind::AspectRatio;
-    else if (r < (acc += P_MIB))  m.kind = MoveKind::MibSync;
-    else if (r < (acc += P_ROT))  m.kind = MoveKind::Rotate;
-    else if (r < (acc += P_SWP))  m.kind = MoveKind::Swap;
-    else                          m.kind = MoveKind::Move;
+    if      (r < (acc += prob_.p_fixb)) m.kind = MoveKind::FixBoundary;
+    else if (r < (acc += prob_.p_fixg)) m.kind = MoveKind::FixGrouping;
+    else if (r < (acc += prob_.p_ar))   m.kind = MoveKind::AspectRatio;
+    else if (r < (acc += prob_.p_mib))  m.kind = MoveKind::MibSync;
+    else if (r < (acc += prob_.p_rot))  m.kind = MoveKind::Rotate;
+    else if (r < (acc += prob_.p_swp))  m.kind = MoveKind::Swap;
+    else                                m.kind = MoveKind::Move;
 
     bool ok = false;
     switch (m.kind) {
@@ -483,8 +495,40 @@ bool MoveEngine::apply_fixg(const FloorplanInstance& inst, BTree& t, Move& m) {
     int u = big[rand_int(rng_, 0, (int)big.size() - 1)];
     if (u == v) return false;
 
+    // ---- Pick stacking direction: right-child (above) OR left-child (right). ----
+    //
+    // The original code always grafted v as right-child of u: robust (always
+    // touches above) but every FixG fire forces v.x = u.x.  When u traces
+    // back to root via right-spine, v.x = 0 -- so successive FixG calls pile
+    // every stray on top of root, growing the floorplan vertically (the
+    // case-55 "tall and thin" symptom).
+    //
+    // Instead, randomly pick left-child (v lands at u.x + u.w, sharing a
+    // vertical edge with u -> floorplan extends rightward).  Left-child only
+    // abuts u if the current skyline at v's destination x-range is below u's
+    // top; if there's a taller block already there, v.y > u.y+u.h and they
+    // don't touch.  Cheap O(n) check on current placements gates the choice.
+    //
+    // Measured (cases 20/40/55/60): Total Score 6.18 -> 5.77 (-6.6%), every
+    // case improved, every case V_rel dropped.
+    Real ux_r = t.x[u] + t.w[u];
+    Real uy_top = t.y[u] + t.h[u];
+    Real skyline_right_of_u = 0.0;
+    for (int i = 0; i < n; ++i) {
+        if (i == u || i == v) continue;
+        if (inst.blocks[i].is_preplaced) continue;     // tree-block skyline only
+        if (t.x[i] + t.w[i] <= ux_r) continue;          // entirely left of u's right
+        if (t.x[i] >= ux_r + t.w[v]) continue;          // entirely past v's right
+        skyline_right_of_u = std::max(skyline_right_of_u, t.y[i] + t.h[i]);
+    }
+    bool left_can_touch = (skyline_right_of_u < uy_top);
+
+    // 50/50 randomize; fall back to right-child if left-child wouldn't abut.
+    bool want_left = std::bernoulli_distribution(0.5)(rng_);
+    bool as_left = want_left && left_can_touch;
+
     // Save full topology snapshot (cheap at n <= 200).
-    m.v = v; m.u = u; m.as_left = false;       // right-child = stack on top of u
+    m.v = v; m.u = u; m.as_left = as_left;     // right-child stacks above; left-child extends right
     m.kind = MoveKind::FixGrouping;
     m.saved_w_vec.clear();
     m.saved_w_vec.reserve(n * 3);

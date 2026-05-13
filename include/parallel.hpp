@@ -14,9 +14,9 @@
 namespace fp {
 
 struct ParallelConfig {
-    int    n_threads = 16;
+    int    n_threads = 8;
     double time_budget_sec = 30.0;
-    SAConfig sa_cfg;       // sa_cfg.time_budget_sec is overridden to time_budget_sec
+    SAConfig sa_cfg;       // sa_cfg.stopping.time_budget_sec is overridden to time_budget_sec
 };
 
 struct ParallelResult {

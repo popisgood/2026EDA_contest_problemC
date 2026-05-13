@@ -25,6 +25,44 @@ namespace fp {
 
 enum class MoveKind { Rotate, Move, Swap, AspectRatio, MibSync, FixBoundary, FixGrouping };
 
+// Tunable move-mix probabilities and AR-move parameters.
+// Centralised here so they can be tweaked from sa.hpp's SAConfig without
+// rebuilding (in principle just re-linking; in practice still a rebuild
+// since we're statically linking, but it keeps every knob in one place).
+//
+// Constraints:
+//   * Six explicit probabilities below must satisfy p_fixb + p_fixg + p_ar
+//     + p_mib + p_rot + p_swp <= 1.0; remainder goes to MoveKind::Move (the
+//     subtree-graft, biggest-Δ move).
+//   * Set p_ar / p_rot higher for low-Δ exploration; set p_fixb / p_fixg
+//     higher when V_boundary / V_grouping stay high after SA.
+struct MoveProb {
+    double p_fixb = 0.05;   // FixBoundary  (always-accept constraint repair)
+    double p_fixg = 0.05;   // FixGrouping  (always-accept constraint repair)
+    double p_ar   = 0.18;   // AspectRatio  (re-sample (w,h) of soft block)
+    double p_mib  = 0.05;   // MibSync      (sync (w,h) across whole MIB group)
+    double p_rot  = 0.15;   // Rotate       (swap w↔h)
+    double p_swp  = 0.15;   // Swap         (exchange two tree positions)
+    // remainder ≈ 0.37 goes to MoveKind::Move (subtree graft, biggest Δ)
+
+    // AspectRatio move samples area in [a·(1−tol_ar), a·(1+tol_ar)].
+    // Hard area tolerance is 1%; keep tol_ar < 0.01 for margin.
+    double tol_ar = 0.005;
+
+    // SA-side aspect-ratio clamp.  Block's own ar_min/ar_max comes from the
+    // contest input (typically 0.25–4.0, i.e. up to 4:1 extreme).  Letting SA
+    // explore the full range produces very elongated blocks that take a lot
+    // of width and disrupt cluster abutment — exactly the case-56 visual
+    // symptom.  We tighten the SA-side range to a subset:
+    //   eff_ar_min = max(b.ar_min, 1/sa_ar_clamp)
+    //   eff_ar_max = min(b.ar_max,   sa_ar_clamp)
+    //   2.0  = blocks stay within [1:2 .. 2:1]  (recommended)
+    //   3.0  = mild clamp [1:3 .. 3:1]
+    //   1.0  = forced square (probably too aggressive, area_target won't fit)
+    //   0    = disable clamp, use block's full ar_min/ar_max range (legacy)
+    double sa_ar_clamp = 2.0;
+};
+
 struct Move {
     MoveKind kind;
 
@@ -54,7 +92,8 @@ struct Move {
 
 class MoveEngine {
 public:
-    explicit MoveEngine(uint64_t seed) : rng_(seed) {}
+    explicit MoveEngine(uint64_t seed, MoveProb prob = {})
+        : rng_(seed), prob_(prob) {}
 
     // Sample and apply a random move.  Returns the move so SA can revert.
     Move propose(const FloorplanInstance& inst, BTree& tree,
@@ -63,8 +102,13 @@ public:
     // Revert a move (undo).
     void revert(const FloorplanInstance& inst, BTree& tree, const Move& m);
 
+    // Allow SA to swap probabilities mid-run (useful for adaptive move mix).
+    void set_prob(const MoveProb& p) { prob_ = p; }
+    const MoveProb& prob() const { return prob_; }
+
 private:
     std::mt19937_64 rng_;
+    MoveProb prob_;
 
     bool apply_rotate(const FloorplanInstance& inst, BTree& t, Move& m);
     bool apply_move  (const FloorplanInstance& inst, BTree& t, Move& m);
