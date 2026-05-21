@@ -72,7 +72,7 @@ struct SAWeights {
     // both 0, sa_cost falls back to using w_hpwl for the whole HPWL_total.
     Real w_hpwl     = 0.0;     // legacy: use the split below by default
     Real w_hpwl_int = 1.0;     // internal (block-to-block) HPWL weight
-    Real w_hpwl_ext = 100.0;     // external (block-to-terminal) HPWL weight.
+    Real w_hpwl_ext = 1.0;     // external (block-to-terminal) HPWL weight.
                                // Equal to int by default = identical to the
                                // pre-split behaviour (w_hpwl=1.0 single).
                                // BUMP THIS to bias SA toward fitting inside
@@ -83,9 +83,9 @@ struct SAWeights {
 
     Real w_overlap  = 5000.0;  // huge -- overlap is hard
     Real w_softarea = 5000.0;  // huge -- soft-block area-tolerance is hard
-    Real w_group    = 300.0;    // grouping  (was 5; contest cost is exponential in V_rel)
+    Real w_group    = 500.0;    // grouping  (was 5; contest cost is exponential in V_rel)
     Real w_mib      = 80.0;    // MIB
-    Real w_bound    = 80.0;    // boundary
+    Real w_bound    = 200.0;    // boundary
 
     // Aspect-ratio penalty.  Adds w_outline * |log(bbox_w/bbox_h)| to sa_cost.
     // Reverted to 0 by default: the terminal extent (via w_hpwl_ext) already
@@ -94,7 +94,7 @@ struct SAWeights {
     // e.g. case 55's ideal bbox is 150x175 (terminal extent), not a square.
     // Leave the knob exposed for cases where terminals are sparse or
     // symmetrically distributed.
-    Real w_outline  = 1.0;
+    Real w_outline  = 0.0;
 };
 
 class Evaluator {

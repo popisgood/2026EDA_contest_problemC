@@ -93,7 +93,7 @@ struct SAStopping {
 
 // ---- T1 calibration ------------------------------------------------------
 struct SACalibration {
-    int    n_probes      = 500;     // # random moves used to estimate Δavg
+    int    n_probes      = 80;     // # random moves used to estimate Δavg
     double p_accept_init = 0.90;   // target uphill-acceptance probability for T1
 };
 
