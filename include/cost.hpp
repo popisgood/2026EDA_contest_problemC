@@ -72,7 +72,7 @@ struct SAWeights {
     // both 0, sa_cost falls back to using w_hpwl for the whole HPWL_total.
     Real w_hpwl     = 0.0;     // legacy: use the split below by default
     Real w_hpwl_int = 1.0;     // internal (block-to-block) HPWL weight
-    Real w_hpwl_ext = 1.0;     // external (block-to-terminal) HPWL weight.
+    Real w_hpwl_ext = 100.0;     // external (block-to-terminal) HPWL weight.
                                // Equal to int by default = identical to the
                                // pre-split behaviour (w_hpwl=1.0 single).
                                // BUMP THIS to bias SA toward fitting inside
@@ -94,7 +94,7 @@ struct SAWeights {
     // e.g. case 55's ideal bbox is 150x175 (terminal extent), not a square.
     // Leave the knob exposed for cases where terminals are sparse or
     // symmetrically distributed.
-    Real w_outline  = 0.0;
+    Real w_outline  = 1.0;
 };
 
 class Evaluator {
