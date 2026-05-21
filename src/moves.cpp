@@ -46,11 +46,44 @@ bool MoveEngine::apply_rotate(const FloorplanInstance& inst, BTree& t, Move& m) 
     // so we either skip (return false) or rotate every block in the group.
     // For simplicity we choose any rotatable block and, if it's in a MIB group,
     // we rotate every block in that group.
+
+    // Case-056 v2 follow-up: rotation is the ONLY move that flips a block's
+    // own dim ratio.  When the floorplan bbox is already tall (h/w >> 1),
+    // rotating a wide block makes it taller -- doubly bad: cluttered shape
+    // AND extra height pressure on bbox.  Skip those rotations 85% of the
+    // time so SA's rotate budget is spent flipping tall blocks horizontal
+    // (which IS what compresses bbox), and similarly for wide bboxes.
+    Real bbox_w_local = 0, bbox_h_local = 0;
+    for (int i = 0; i < n; ++i) {
+        bbox_w_local = std::max(bbox_w_local, t.x[i] + t.w[i]);
+        bbox_h_local = std::max(bbox_h_local, t.y[i] + t.h[i]);
+    }
+    const Real bbox_ar = (bbox_w_local > 0 && bbox_h_local > 0)
+                       ? bbox_h_local / bbox_w_local : 1.0;
+    const bool bbox_tall_strong = (bbox_ar > 1.20);
+    const bool bbox_wide_strong = (bbox_ar < 1.0 / 1.20);
+    constexpr double SKIP_PROB = 0.85;
+
     int tries = 32;
     while (tries-- > 0) {
         int v = rand_int(rng_, 0, n - 1);
         const Block& b = inst.blocks[v];
         if (block_dims_locked(b)) continue;
+
+        // Skip bad-direction rotations with high probability (15% still
+        // fires to preserve some exploration -- pure-greedy rotation
+        // creates an SA mixing pathology where blocks get stuck).
+        if (bbox_tall_strong) {
+            // Tall bbox: only USEFUL to rotate currently-tall blocks
+            // (h > w) -- they become wide, reducing bbox_h pressure.
+            // Rotating an already-wide block makes it taller = bad.
+            bool block_wide = (t.w[v] > t.h[v] * 1.10);
+            if (block_wide && std::bernoulli_distribution(SKIP_PROB)(rng_)) continue;
+        } else if (bbox_wide_strong) {
+            bool block_tall = (t.h[v] > t.w[v] * 1.10);
+            if (block_tall && std::bernoulli_distribution(SKIP_PROB)(rng_)) continue;
+        }
+
         m.v = v;
         m.saved_w = t.w[v]; m.saved_h = t.h[v];
         if (b.mib_group >= 0) {
@@ -74,6 +107,25 @@ bool MoveEngine::apply_rotate(const FloorplanInstance& inst, BTree& t, Move& m) 
 bool MoveEngine::apply_move(const FloorplanInstance& inst, BTree& t, Move& m) {
     const int n = inst.n_blocks;
     if (n < 2) return false;
+
+    // Case-056 v2: the "Move" kind is SA's biggest-Δ move, fired ~37% of the
+    // time.  Its as_left choice was 50/50 -- which means half of every Move
+    // sample biases toward height (right-child = "stack above u").  When the
+    // current floorplan is already tall, the move set was secretly fighting
+    // bbox_balance_pass on every SA iter.  Bias the coin like apply_fixg
+    // already does so SA's topology drift trends toward squareness.
+    Real bbox_w_local = 0, bbox_h_local = 0;
+    for (int i = 0; i < n; ++i) {
+        bbox_w_local = std::max(bbox_w_local, t.x[i] + t.w[i]);
+        bbox_h_local = std::max(bbox_h_local, t.y[i] + t.h[i]);
+    }
+    const Real bbox_ar = (bbox_w_local > 0 && bbox_h_local > 0)
+                       ? bbox_h_local / bbox_w_local : 1.0;
+    double p_left;
+    if      (bbox_ar > 1.20)        p_left = 0.70;   // tall: prefer width-extending lc
+    else if (bbox_ar < 1.0 / 1.20)  p_left = 0.30;   // wide: prefer height-extending rc
+    else                            p_left = 0.50;   // balanced: original coin flip
+
     int tries = 64;
     while (tries-- > 0) {
         int v = rand_int(rng_, 0, n - 1);
@@ -87,7 +139,7 @@ bool MoveEngine::apply_move(const FloorplanInstance& inst, BTree& t, Move& m) {
         m.saved_parent = t.nodes[v].parent;
         m.saved_lc = t.nodes[v].lc;
         m.saved_rc = t.nodes[v].rc;
-        m.as_left = std::bernoulli_distribution(0.5)(rng_);
+        m.as_left = std::bernoulli_distribution(p_left)(rng_);
         // We use op_move for the topology change.  Note op_move can
         // implicitly graft existing children of u onto v's slot, which makes
         // a perfect revert tricky.  Therefore we implement revert by saving
@@ -145,6 +197,28 @@ bool MoveEngine::apply_swap(const FloorplanInstance& inst, BTree& t, Move& m) {
 
 bool MoveEngine::apply_ar(const FloorplanInstance& inst, BTree& t, Move& m) {
     const int n = inst.n_blocks;
+
+    // Pre-compute current bbox AR so we can bias new (w, h) toward the
+    // direction that compresses the bbox.  Case-056 fix: when the floorplan
+    // is 135×270 (tall), uniformly sampling h/w ∈ [1/2, 2] produces blocks
+    // shaped any-which-way; ~50% of AR moves make individual blocks taller,
+    // worsening the bbox.  Biasing toward h/w < 1 when bbox is tall (and
+    // h/w > 1 when wide) gives SA a steady push toward a square outline.
+    Real bbox_w_local = 0, bbox_h_local = 0;
+    for (int i = 0; i < n; ++i) {
+        bbox_w_local = std::max(bbox_w_local, t.x[i] + t.w[i]);
+        bbox_h_local = std::max(bbox_h_local, t.y[i] + t.h[i]);
+    }
+    const Real bbox_ar = (bbox_w_local > 0 && bbox_h_local > 0)
+                       ? bbox_h_local / bbox_w_local : 1.0;
+    // Bias probability: how often we restrict sampling to the compressing
+    // half of the AR range.  Bumped from 0.70 -> 0.85 after case-056 v2:
+    // even at 0.70, ~30% of AR samples landed in the bbox-extending half
+    // every iter, mostly cancelling out the other 70%.  0.85 + 15% free
+    // exploration keeps SA non-degenerate while reliably steering toward
+    // square outlines.
+    constexpr double BIAS_PROB = 0.85;
+
     int tries = 32;
     while (tries-- > 0) {
         int v = rand_int(rng_, 0, n - 1);
@@ -166,6 +240,19 @@ bool MoveEngine::apply_ar(const FloorplanInstance& inst, BTree& t, Move& m) {
             ar_hi = std::min(ar_hi, prob_.sa_ar_clamp);
             if (ar_lo > ar_hi) { ar_lo = b.ar_min; ar_hi = b.ar_max; }  // sanity
         }
+
+        // Bbox-AR-aware bias.  Only fire when bbox is significantly tilted
+        // and only with probability BIAS_PROB so SA still explores freely.
+        if (bbox_ar > 1.20 && std::bernoulli_distribution(BIAS_PROB)(rng_)) {
+            // Tall bbox: prefer wider blocks (h/w < 1).
+            Real new_hi = std::min(ar_hi, 1.0);
+            if (new_hi > ar_lo + 1e-6) ar_hi = new_hi;
+        } else if (bbox_ar < 1.0 / 1.20 && std::bernoulli_distribution(BIAS_PROB)(rng_)) {
+            // Wide bbox: prefer taller blocks (h/w > 1).
+            Real new_lo = std::max(ar_lo, 1.0);
+            if (new_lo < ar_hi - 1e-6) ar_lo = new_lo;
+        }
+
         auto [nw, nh] = sample_dims(b.area_target, ar_lo, ar_hi, rng_, prob_.tol_ar);
         t.w[v] = nw;
         t.h[v] = nh;
@@ -280,8 +367,8 @@ bool MoveEngine::apply_fixb(const FloorplanInstance& inst, BTree& t, Move& m,
         return true;
     }
 
-    // Tactic 2: move v to be the right-child of any constrained block already
-    // at edge e (this anchors it on the edge in the next packing).
+    // Tactic 2: move v to be the right-/left-child of any block already at
+    // edge e (this anchors it on the edge in the next packing).
     //
     // We DON'T set always_accept = true here.  Tactic 2 forces v to be a
     // child of a block already at the bbox edge, which in a B*-tree pushes
@@ -291,6 +378,24 @@ bool MoveEngine::apply_fixb(const FloorplanInstance& inst, BTree& t, Move& m,
     // mechanism that produced the staircase / "blocks float upward" artifact
     // we observed on case 55.  Letting Metropolis decide whether to keep this
     // move means SA only commits to it when the overall floorplan benefits.
+    //
+    // ADDITIONAL GUARD (case-056 fix): even with Metropolis filtering, tactic
+    // 2 in a badly-imbalanced floorplan is poison.  For E_TOP/C_TR/C_TL the
+    // graft is `as_left=false` (right-child = stacked above u) -- if the
+    // floorplan is already tall and thin, this makes it taller still, and SA
+    // accepts because (V_bound penalty saved) > (bbox penalty added) at the
+    // current weights.  Symmetrically, E_RIGHT/C_BR (and E_BOTTOM when u is
+    // rightmost) widens an already-wide floorplan.  Skip tactic 2 when it
+    // would grow the dominant dimension by >20% past the shorter one.
+    // Tactic 1 (swap above) is dimension-neutral and unaffected by this gate.
+    const bool grows_height_t2 =
+        (e == E_TOP  || e == C_TR || e == C_TL ||
+         e == E_LEFT || e == C_BL);
+    const bool grows_width_t2 =
+        (e == E_RIGHT || e == C_BR || e == E_BOTTOM);
+    if (grows_height_t2 && Hbb > Wbb * 1.20) return false;
+    if (grows_width_t2  && Wbb > Hbb * 1.20) return false;
+
     std::vector<int> anchors;
     for (int j = 0; j < n; ++j) {
         if (j == v) continue;
@@ -523,8 +628,18 @@ bool MoveEngine::apply_fixg(const FloorplanInstance& inst, BTree& t, Move& m) {
     }
     bool left_can_touch = (skyline_right_of_u < uy_top);
 
-    // 50/50 randomize; fall back to right-child if left-child wouldn't abut.
-    bool want_left = std::bernoulli_distribution(0.5)(rng_);
+    // Pick stacking direction with bbox-AR bias.  50/50 was the previous
+    // default and is fine for square-ish floorplans, but when the bbox is
+    // tall and thin (case-056 pathology) we should strongly prefer left-
+    // child grafts (which extend width) over right-child grafts (which
+    // extend height).  Symmetric bias when bbox is wide.
+    double p_left = 0.5;
+    if (Wbb > 0 && Hbb > 0) {
+        Real ar = Hbb / Wbb;
+        if      (ar > 1.20) p_left = 0.80;   // tall: push grafts rightward (extend width)
+        else if (ar < 1.0 / 1.20) p_left = 0.20;   // wide: push grafts upward (extend height)
+    }
+    bool want_left = std::bernoulli_distribution(p_left)(rng_);
     bool as_left = want_left && left_can_touch;
 
     // Save full topology snapshot (cheap at n <= 200).
