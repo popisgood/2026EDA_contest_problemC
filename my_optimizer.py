@@ -344,6 +344,14 @@ class MyOptimizer(FloorplanOptimizer):
         self.seed = int(os.environ.get("FLOORPLANNER_SEED", "1"))
         self.keep = os.environ.get("FLOORPLANNER_KEEP", "0") == "1"
 
+        # Feasibility-triggered budget escalation.  When the solver returns
+        # rc=4 (ran fine but the best solution is still infeasible -> cost M=10),
+        # re-run that one case with a larger budget instead of shipping a
+        # cost-10 result.  Keeps the aggressive short budget on the easy cases
+        # while rescuing the few large/dense ones.  Disable with
+        # FLOORPLANNER_ESCALATE=0.
+        self.escalate = os.environ.get("FLOORPLANNER_ESCALATE", "1") != "0"
+
         # Workdir survives across solve() calls so we can inspect after a run
         self.workdir = Path(tempfile.mkdtemp(prefix="my_optimizer_"))
         self._call_idx = 0
@@ -384,40 +392,87 @@ class MyOptimizer(FloorplanOptimizer):
         _write_txt(in_txt, block_count, area, b2b_connectivity,
                    p2b_connectivity, pins_pos, cons, tp)
 
-        cmd = [
-            str(self.binary), str(in_txt), str(out_sol),
-            "--time",    f"{time_s:g}",
-            "--threads", str(self.threads),
-            "--seed",    str(self.seed + idx),
-        ]
-
         if self.verbose:
             print(f"[my_optimizer] case {idx}: n={block_count} budget={time_s:.1f}s",
                   file=sys.stderr)
 
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            sys.stderr.write(
-                f"[my_optimizer] solver binary not found: {self.binary}\n"
-                f"  Set FLOORPLANNER_BIN, or place the binary next to my_optimizer.py.\n"
-            )
-            return self._fallback(block_count, area)
-
-        if res.returncode != 0:
-            sys.stderr.write(
-                f"[my_optimizer] case {idx}: solver exited with rc={res.returncode}\n"
-                + (res.stderr[-2000:] if res.stderr else "") + "\n"
-            )
-            return self._fallback(block_count, area)
-
-        positions = _parse_sol(out_sol, block_count, area)
+        positions = self._run_solver(in_txt, out_sol, block_count, time_s, idx, area)
 
         if not self.keep:
             in_txt.unlink(missing_ok=True)
             out_sol.unlink(missing_ok=True)
 
         return positions
+
+    def _run_solver(self, in_txt: Path, out_sol: Path, block_count: int,
+                    base_time_s: float, idx: int,
+                    area: torch.Tensor) -> List[Tuple[float, float, float, float]]:
+        """Run the C++ solver, escalating the time budget on infeasibility.
+
+        The binary returns rc=0 (feasible), rc=4 (ran fine but best solution
+        infeasible -> contest cost M=10), or another code on a real error.
+        Because an infeasible case costs the maximum penalty, on the few hard
+        cases it is always worth re-running with more time; the cheap cases
+        keep the fast budget and never escalate.  The same input file (and any
+        WARM_POSITIONS hint already appended to it) is reused on every attempt.
+        """
+        # Build the escalation ladder.  Rung 1 is the configured budget; rung 2
+        # is a "safe" budget known to legalise the large/dense cases.
+        budgets = [base_time_s]
+        if self.escalate:
+            floor = float(os.environ.get("FLOORPLANNER_ESCALATE_FLOOR", "60"))
+            cap   = float(os.environ.get("FLOORPLANNER_ESCALATE_CAP", "90"))
+            safe  = min(cap, max(floor, 0.6 * block_count))
+            if safe > base_time_s * 1.3:
+                budgets.append(safe)
+
+        best_effort: Optional[List[Tuple[float, float, float, float]]] = None
+        for attempt, budget in enumerate(budgets):
+            # Vary the seed across escalation rungs so each retry is an
+            # INDEPENDENT draw, not just more time on the same (possibly
+            # unlucky) 8-thread population.  Feasibility on large/dense
+            # anchored cases is strongly seed-dependent, so independent rungs
+            # multiply the odds of landing a feasible arrangement.
+            cmd = [
+                str(self.binary), str(in_txt), str(out_sol),
+                "--time",    f"{budget:g}",
+                "--threads", str(self.threads),
+                "--seed",    str(self.seed + idx + attempt * 7919),
+            ]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except FileNotFoundError:
+                sys.stderr.write(
+                    f"[my_optimizer] solver binary not found: {self.binary}\n"
+                    f"  Set FLOORPLANNER_BIN, or place the binary next to my_optimizer.py.\n"
+                )
+                return self._fallback(block_count, area)
+
+            if res.returncode == 0:
+                return _parse_sol(out_sol, block_count, area)          # feasible
+
+            if res.returncode == 4:
+                # Infeasible, but a real best-effort layout was written.  Keep
+                # it and escalate to a larger budget if one remains.
+                best_effort = _parse_sol(out_sol, block_count, area)
+                if self.verbose:
+                    nxt = (f"; escalating to {budgets[attempt + 1]:g}s"
+                           if attempt + 1 < len(budgets) else "")
+                    sys.stderr.write(
+                        f"[my_optimizer] case {idx}: infeasible at {budget:g}s{nxt}\n"
+                    )
+                continue
+
+            sys.stderr.write(
+                f"[my_optimizer] case {idx}: solver exited with rc={res.returncode}\n"
+                + (res.stderr[-2000:] if res.stderr else "") + "\n"
+            )
+            return self._fallback(block_count, area)
+
+        # Exhausted the ladder while still infeasible: return the real layout
+        # (cost M either way, but a true placement is never worse than the
+        # overlapping-squares emergency fallback).
+        return best_effort if best_effort is not None else self._fallback(block_count, area)
 
     @staticmethod
     def _fallback(block_count: int, area: torch.Tensor):

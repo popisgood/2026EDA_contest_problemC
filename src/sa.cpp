@@ -198,6 +198,17 @@ SAResult SimulatedAnnealing::run(BTree current) {
             c = evaluator_.evaluate(inst_, current, pr2);
             cost = evaluator_.sa_cost(c, cfg_.weights, inst_);
             iters_since_improvement = 0;
+            // Feasibility rescue.  A cold re-anchor restarts from `best` at the
+            // current (possibly frozen) T, which just re-freezes in the same
+            // infeasible basin -- exactly the failure mode on large/dense cases
+            // with several anchored blocks (only ~1/8 threads ever reach a
+            // feasible arrangement).  If the best so far is STILL infeasible,
+            // reheat to full T1 so the chain re-explores hard for the remaining
+            // budget.  A feasible best keeps the cold re-anchor (pure quality
+            // refinement), so this never disturbs cases that already converged.
+            if (!R.best_costs.feasible) {
+                T = T1;
+            }
         }
 
         // ---- CSV log every 4th iter (log accepted `cost`, NOT `nc`) ----

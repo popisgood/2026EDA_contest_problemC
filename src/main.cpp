@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
               << " mib_groups=" << inst.mib_groups.size()
               << " baseline_hpwl=" << inst.baseline_hpwl
               << " baseline_area=" << inst.baseline_area
+              << " warm=" << (inst.has_warm ? 1 : 0)
               << "\n";
 
     ParallelConfig pcfg;
@@ -74,14 +75,23 @@ int main(int argc, char** argv) {
     Evaluator ev;
     Real cc = ev.contest_cost(R.best.best_costs, 1.0);
     double secs = std::chrono::duration<double>(t1 - t0).count();
+    const auto& bc = R.best.best_costs;
     std::cerr << "[main] best thread=" << R.best_thread
-              << " feasible=" << (R.best.best_costs.feasible ? 1 : 0)
+              << " feasible=" << (bc.feasible ? 1 : 0)
               << " contest_cost=" << cc
-              << " hpwl_gap=" << R.best.best_costs.hpwl_gap
-              << " area_gap=" << R.best.best_costs.area_gap
-              << " V_rel=" << R.best.best_costs.v_relative
+              << " hpwl_gap=" << bc.hpwl_gap
+              << " area_gap=" << bc.area_gap
+              << " V_rel=" << bc.v_relative
               << " (n_feasible_threads=" << R.n_feasible << "/" << pcfg.n_threads << ")"
               << "  elapsed=" << secs << "s\n";
+    std::cerr << "[main] HARD: overlap=" << bc.overlap_violation
+              << " area=" << bc.area_violation
+              << " fixed=" << bc.fixed_violation
+              << " preplaced=" << bc.preplaced_violation
+              << "  | overlap_area=" << bc.overlap_area
+              << " area_drift_excess=" << bc.area_drift_excess
+              << "  V[grp=" << bc.v_grouping << " mib=" << bc.v_mib
+              << " bnd=" << bc.v_boundary << " /Nsoft=" << bc.n_soft_norm << "]\n";
 
     if (!save_solution(out_path, inst, R.best.best_tree)) {
         std::cerr << "[main] cannot write " << out_path << "\n";

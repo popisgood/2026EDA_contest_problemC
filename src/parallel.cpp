@@ -217,6 +217,121 @@ BTree make_initial(const FloorplanInstance& inst, uint64_t seed) {
     return t;
 }
 
+// Build an initial tree from the ML predictor's WARM_POSITIONS.
+//
+// The predictor gives an approximate center (cx,cy) and shape (w,h) for every
+// block.  Those positions overlap and are NOT a legal floorplan, but their
+// RELATIVE arrangement encodes where the model thinks each block belongs.  We
+// turn that arrangement into a B*-tree and let the contour packer compact it
+// into a legal placement:
+//
+//   - soft-block dims : adopt the ML aspect ratio, renormalised to the exact
+//                       area target, so the 1% area HARD constraint still holds.
+//   - insertion order : bottom-left first (sort by x+y of the lower-left
+//                       corner) so early inserts land near the origin, matching
+//                       the packer's growth direction; preplaced blocks go last
+//                       (kept as leaves -- same rationale as make_initial).
+//   - parent / slot   : attach each block under the nearest already-placed
+//                       block; LEFT child if the ML says it is to the RIGHT,
+//                       RIGHT child if the ML says it is ABOVE.
+//
+// Any malformed result falls back to make_initial(), so a warm start can never
+// make the solver worse than the baseline initial tree.
+BTree make_initial_warm(const FloorplanInstance& inst, uint64_t seed) {
+    const int n = inst.n_blocks;
+    BTree t;
+    t.init(n);
+    if (n == 0) { t.root = NO_NODE; return t; }
+    if (!inst.has_warm) return make_initial(inst, seed);
+
+    auto clampr = [](Real v, Real lo, Real hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    };
+
+    // ---- dimensions --------------------------------------------------------
+    for (int i = 0; i < n; ++i) {
+        const Block& b = inst.blocks[i];
+        if (b.is_fixed || b.is_preplaced) {
+            t.w[i] = b.w_input;
+            t.h[i] = b.h_input;
+        } else if (b.area_target > 0) {
+            Real wm = inst.warm_w[i], hm = inst.warm_h[i];
+            if (wm > 1e-9 && hm > 1e-9) {
+                Real aspect = clampr(hm / wm, b.ar_min, b.ar_max);   // h / w
+                Real h = std::sqrt(b.area_target * aspect);
+                Real w = b.area_target / h;                          // w*h == area exactly
+                t.w[i] = w; t.h[i] = h;
+            } else {
+                Real s = std::sqrt(b.area_target);
+                t.w[i] = s; t.h[i] = s;
+            }
+        } else {
+            t.w[i] = 1.0; t.h[i] = 1.0;
+        }
+    }
+    // MIB sync: share one shape across each MIB group (same policy as make_initial).
+    for (const auto& g : inst.mib_groups) {
+        Real W = -1, H = -1;
+        for (int b : g)
+            if (!inst.blocks[b].is_fixed && !inst.blocks[b].is_preplaced) { W = t.w[b]; H = t.h[b]; break; }
+        if (W <= 0) continue;
+        for (int b : g)
+            if (!inst.blocks[b].is_fixed && !inst.blocks[b].is_preplaced) { t.w[b] = W; t.h[b] = H; }
+    }
+
+    // ---- lower-left corners implied by the ML centers ----------------------
+    std::vector<Real> X(n), Y(n);
+    for (int i = 0; i < n; ++i) {
+        X[i] = inst.warm_cx[i] - t.w[i] * 0.5;
+        Y[i] = inst.warm_cy[i] - t.h[i] * 0.5;
+    }
+
+    // ---- insertion order: bottom-left first, preplaced last ----------------
+    std::vector<int> order(n);
+    for (int i = 0; i < n; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        bool pa = inst.blocks[a].is_preplaced, pb = inst.blocks[b].is_preplaced;
+        if (pa != pb) return !pa;                 // non-preplaced before preplaced
+        Real ka = X[a] + Y[a], kb = X[b] + Y[b];
+        if (ka != kb) return ka < kb;
+        return a < b;
+    });
+
+    // ---- build tree: nearest placed anchor + directional slot --------------
+    int root = order[0];
+    t.root = root;
+    t.nodes[root] = BNode{};
+    std::vector<int> placed;
+    placed.reserve(n);
+    placed.push_back(root);
+
+    for (int k = 1; k < n; ++k) {
+        int v = order[k];
+        // Nearest already-placed block to v's lower-left corner.
+        int u = root; Real bestd = REAL_INF;
+        for (int p : placed) {
+            Real dx = X[v] - X[p], dy = Y[v] - Y[p];
+            Real d = dx * dx + dy * dy;
+            if (d < bestd) { bestd = d; u = p; }
+        }
+        // Descend from u to the first free slot, preferring the ML direction.
+        while (true) {
+            bool want_left = (X[v] - X[u]) >= (Y[v] - Y[u]);  // right -> lc, above -> rc
+            bool lfree = (t.nodes[u].lc == NO_NODE);
+            bool rfree = (t.nodes[u].rc == NO_NODE);
+            if (want_left && lfree) { t.nodes[u].lc = v; t.nodes[v].parent = u; break; }
+            if (!want_left && rfree){ t.nodes[u].rc = v; t.nodes[v].parent = u; break; }
+            if (lfree)              { t.nodes[u].lc = v; t.nodes[v].parent = u; break; }
+            if (rfree)              { t.nodes[u].rc = v; t.nodes[v].parent = u; break; }
+            u = want_left ? t.nodes[u].lc : t.nodes[u].rc;    // both full: descend
+        }
+        placed.push_back(v);
+    }
+
+    if (!t.validate()) return make_initial(inst, seed);   // safety net
+    return t;
+}
+
 } // namespace
 
 ParallelResult run_parallel(const FloorplanInstance& inst,
@@ -241,9 +356,21 @@ ParallelResult run_parallel(const FloorplanInstance& inst,
             inst, sa_cfg, base_seed + 1009u * (uint64_t)i, &shared_stop);
     }
 
+    // When the ML predictor supplied WARM_POSITIONS, dedicate up to half the
+    // threads to the ML warm-start tree and keep the rest on the diverse
+    // make_initial() restarts.  Best-of selection below means the warm threads
+    // can only help: if the ML start is worse, a diverse thread still wins.
+    int n_warm = inst.has_warm ? std::max(1, N / 2) : 0;
+    if (cfg.sa_cfg.verbose && n_warm > 0) {
+        std::cerr << "[parallel] ML warm-start active on " << n_warm << "/" << N
+                  << " threads\n";
+    }
+
     for (int i = 0; i < N; ++i) {
-        threads.emplace_back([i, &inst, &results, &sas, base_seed]() {
-            BTree init = make_initial(inst, base_seed + 17u * (uint64_t)i);
+        threads.emplace_back([i, n_warm, &inst, &results, &sas, base_seed]() {
+            BTree init = (i < n_warm)
+                ? make_initial_warm(inst, base_seed + 17u * (uint64_t)i)
+                : make_initial(inst, base_seed + 17u * (uint64_t)i);
             results[i] = sas[i]->run(std::move(init));
         });
     }

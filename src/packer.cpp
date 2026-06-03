@@ -482,6 +482,33 @@ PackResult Packer::pack(const FloorplanInstance& inst, BTree& tree) const {
     std::vector<Seg> contour;       // empty -> ground level 0
     contour.push_back(Seg{0.0, 0.0});
 
+    // Pre-seed the contour with every anchored (preplaced) block's footprint
+    // BEFORE placing any tree block.  Preplaced blocks live at a FIXED (x,y),
+    // so every tree block must be aware of them from the very start; otherwise
+    // a tree block placed early in DFS order can land inside an anchor's
+    // footprint, and the fixed anchor then overlaps it -- the persistent
+    // cost-10 "overlap" failure on the large/dense anchored cases (93/95/98).
+    // With the footprints pre-seeded, max_height_in() lifts any tree block
+    // whose x-range hits an anchor up above that anchor, so tree-vs-anchor
+    // overlap becomes impossible by construction.
+    //
+    // Seed in ascending top-edge order so a taller anchor sharing an x-range
+    // with a shorter one always raises (never lowers) the contour there.
+    {
+        std::vector<int> anchors;
+        for (int i = 0; i < n; ++i)
+            if (inst.blocks[i].is_preplaced) anchors.push_back(i);
+        std::sort(anchors.begin(), anchors.end(), [&](int a, int b){
+            return (inst.blocks[a].y_input + inst.blocks[a].h_input)
+                 < (inst.blocks[b].y_input + inst.blocks[b].h_input);
+        });
+        for (int i : anchors) {
+            const Block& b = inst.blocks[i];
+            update_contour(contour, b.x_input, b.x_input + b.w_input,
+                           b.y_input + b.h_input);
+        }
+    }
+
     // We need an iterative DFS in B*-tree order: parent before children,
     // left child fully before right child (so the contour is correct).
     // Use a stack with a state flag.
@@ -509,19 +536,16 @@ PackResult Packer::pack(const FloorplanInstance& inst, BTree& tree) const {
 
             // Determine x.
             if (b.is_preplaced) {
-                // anchored: ignore tree-derived x,y
+                // anchored: ignore tree-derived x,y.  The contour was already
+                // pre-seeded with this footprint before the DFS (see top of
+                // pack()), so we must NOT update it again here -- re-asserting
+                // the anchor's top would clobber the height of any tree block
+                // already stacked above this anchor's x-range and reintroduce
+                // overlap.
                 tree.x[v] = b.x_input;
                 tree.y[v] = b.y_input;
                 tree.w[v] = b.w_input;
                 tree.h[v] = b.h_input;
-                // Do not update the contour with anchored blocks here -- we
-                // still need to flag overlap if a previously-placed tree block
-                // intersects this anchor.  We handle that in a post-pass below
-                // by just registering the rectangle into the contour anyway:
-                // the anchored block *is* part of the floorplan and tree
-                // blocks placed *afterwards* must respect it.
-                update_contour(contour, b.x_input, b.x_input + b.w_input,
-                               b.y_input + b.h_input);
             } else {
                 if (parent == NO_NODE) {
                     px = 0.0;

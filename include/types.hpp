@@ -115,6 +115,17 @@ struct FloorplanInstance {
     // track the baseline outline only for SA cost shaping.
     Real outline_w = 0.0;
     Real outline_h = 0.0;
+
+    // ---- ML warm-start (optional) -------------------------------------------
+    // Populated only when the input file carries a WARM_POSITIONS section
+    // (emitted by my_optimizer_ml.py).  (warm_cx, warm_cy) is the ML predictor's
+    // guessed center for each block id and (warm_w, warm_h) its guessed shape;
+    // warm_priority is an optional suggested insertion order (block ids).  When
+    // has_warm is false these stay empty and the solver behaves exactly as
+    // before -- the warm start is a pure add-on with no effect on legacy inputs.
+    bool has_warm = false;
+    std::vector<Real> warm_cx, warm_cy, warm_w, warm_h;
+    std::vector<int>  warm_priority;
 };
 
 } // namespace fp
