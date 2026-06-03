@@ -474,6 +474,159 @@ static void bbox_balance_pass(const FloorplanInstance& inst, BTree& tree) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// grouping_repair_pass -- deterministic grouping (cluster) fixer.
+//
+// Grouping requires every member of a cluster to form ONE connected component
+// (each member touching at least one sibling along a shared edge).  Like the
+// boundary constraint this is already PENALISED (w_group in sa_cost, V_grouping
+// in the contest cost), but only the stochastic 5% FixGrouping move actually
+// repairs it -- and compaction keeps scattering members every pass.  So dense
+// cases finish with leftover grouping violations even though the cost "knows"
+// about them.  This pass deterministically reattaches ISOLATED members (those
+// touching no sibling) by sliding each flush against a sibling whenever a free
+// adjacent slot exists.  Conservative on purpose:
+//   * only moves members that touch NO sibling (minimal disturbance)
+//   * never moves preplaced or boundary-constrained members (boundary pass
+//     owns those; keeps the two repairs from fighting)
+// Reduces the component count -> lowers V_grouping -> shrinks exp(2*V_rel).
+static void grouping_repair_pass(const FloorplanInstance& inst, BTree& tree) {
+    const int n = (int)tree.nodes.size();
+    if (inst.grouping_groups.empty()) return;
+
+    auto touches = [&](int a, int b) -> bool {
+        Real ax = tree.x[a], ay = tree.y[a], aw = tree.w[a], ah = tree.h[a];
+        Real bx = tree.x[b], by = tree.y[b], bw = tree.w[b], bh = tree.h[b];
+        if (std::abs((ax + aw) - bx) < 1e-7 || std::abs((bx + bw) - ax) < 1e-7) {
+            Real ylo = std::max(ay, by), yhi = std::min(ay + ah, by + bh);
+            if (yhi - ylo > 1e-7) return true;            // shared vertical edge
+        }
+        if (std::abs((ay + ah) - by) < 1e-7 || std::abs((by + bh) - ay) < 1e-7) {
+            Real xlo = std::max(ax, bx), xhi = std::min(ax + aw, bx + bw);
+            if (xhi - xlo > 1e-7) return true;            // shared horizontal edge
+        }
+        return false;
+    };
+    auto cell_free = [&](int i, Real nx, Real ny) -> bool {
+        Real w = tree.w[i], h = tree.h[i];
+        for (int j = 0; j < n; ++j) {
+            if (j == i) continue;
+            if (rect_overlap(nx, ny, w, h, tree.x[j], tree.y[j], tree.w[j], tree.h[j]))
+                return false;
+        }
+        return true;
+    };
+    auto movable = [&](int i) -> bool {
+        return !inst.blocks[i].is_preplaced && inst.blocks[i].bedge == E_NONE;
+    };
+
+    for (const auto& g : inst.grouping_groups) {
+        if ((int)g.size() <= 1) continue;
+        for (int pass = 0; pass < 2; ++pass) {
+            bool moved = false;
+            for (int s : g) {
+                if (!movable(s)) continue;
+                bool connected = false;
+                for (int t : g) if (t != s && touches(s, t)) { connected = true; break; }
+                if (connected) continue;                  // already attached
+                bool placed = false;
+                for (int t : g) {
+                    if (t == s) continue;
+                    const Real tx = tree.x[t], ty = tree.y[t], tw = tree.w[t], th = tree.h[t];
+                    const Real sw = tree.w[s], sh = tree.h[s];
+                    const Real cand[4][2] = {
+                        { tx + tw, ty      },             // right of t
+                        { tx - sw, ty      },             // left  of t
+                        { tx,      ty + th },             // above t
+                        { tx,      ty - sh },             // below t
+                    };
+                    for (int k = 0; k < 4; ++k) {
+                        Real nx = cand[k][0], ny = cand[k][1];
+                        if (nx < -1e-9 || ny < -1e-9) continue;
+                        if (!cell_free(s, nx, ny)) continue;
+                        tree.x[s] = nx; tree.y[s] = ny;
+                        placed = true; moved = true;
+                        break;
+                    }
+                    if (placed) break;
+                }
+            }
+            if (!moved) break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// boundary_repair_pass -- deterministic soft-boundary fixer.
+//
+// Boundary blocks must touch a specific bbox edge (L/R/T/B) or corner.  The
+// contour packer + left/down compaction pull every block toward the origin on
+// every pack, so TOP/RIGHT boundary blocks are constantly dragged off their
+// edge.  The stochastic 5%-probability FixBoundary SA move cannot keep up --
+// it fights a deterministic compaction that runs every single pack, so dense
+// cases finish with many boundary violations (case 95: V_boundary≈26, which
+// alone drives exp(2·V_rel) ≈ 3× on the contest cost).
+//
+// This pass closes that gap deterministically: after compaction, slide each
+// boundary block onto its required edge whenever the target cell is free.
+//   * never overlaps   -- the move is skipped if the target cell is occupied
+//   * never grows bbox  -- R/T targets land exactly on the EXISTING bbox edge
+//   * preplaced skipped -- their (x,y) is hard-locked
+// The only cost is a little whitespace where a block vacates an interior slot,
+// which does not change bbox area -- a great trade for cutting the exponential
+// V_rel penalty.
+static void boundary_repair_pass(const FloorplanInstance& inst, BTree& tree) {
+    const int n = (int)tree.nodes.size();
+    if (n == 0) return;
+
+    auto cell_free = [&](int i, Real nx, Real ny) -> bool {
+        Real w = tree.w[i], h = tree.h[i];
+        for (int j = 0; j < n; ++j) {
+            if (j == i) continue;
+            if (rect_overlap(nx, ny, w, h, tree.x[j], tree.y[j], tree.w[j], tree.h[j]))
+                return false;
+        }
+        return true;
+    };
+
+    // Two sweeps: moving one block onto its edge can free the cell another
+    // boundary block needs.  Early-exits when a full sweep moves nothing.
+    for (int pass = 0; pass < 2; ++pass) {
+        Real Wbb = 0, Hbb = 0;
+        for (int i = 0; i < n; ++i) {
+            Wbb = std::max(Wbb, tree.x[i] + tree.w[i]);
+            Hbb = std::max(Hbb, tree.y[i] + tree.h[i]);
+        }
+        bool moved = false;
+        for (int i = 0; i < n; ++i) {
+            const Block& b = inst.blocks[i];
+            if (b.bedge == E_NONE) continue;
+            if (b.is_preplaced) continue;
+            const Real w = tree.w[i], h = tree.h[i];
+            Real nx = tree.x[i], ny = tree.y[i];
+            switch (b.bedge) {
+                case E_LEFT:                 nx = 0.0;                     break;
+                case E_RIGHT:                nx = Wbb - w;                 break;
+                case E_BOTTOM:               ny = 0.0;                     break;
+                case E_TOP:                  ny = Hbb - h;                 break;
+                case C_BL:    nx = 0.0;       ny = 0.0;                    break;
+                case C_BR:    nx = Wbb - w;   ny = 0.0;                    break;
+                case C_TL:    nx = 0.0;       ny = Hbb - h;                break;
+                case C_TR:    nx = Wbb - w;   ny = Hbb - h;                break;
+                default: break;
+            }
+            if (nx < -1e-9 || ny < -1e-9) continue;            // would leave canvas
+            if (std::abs(nx - tree.x[i]) < 1e-9 &&
+                std::abs(ny - tree.y[i]) < 1e-9) continue;     // already on edge
+            if (!cell_free(i, nx, ny)) continue;               // occupied -> skip
+            tree.x[i] = nx;
+            tree.y[i] = ny;
+            moved = true;
+        }
+        if (!moved) break;
+    }
+}
+
 PackResult Packer::pack(const FloorplanInstance& inst, BTree& tree) const {
     PackResult result;
     const int n = static_cast<int>(tree.nodes.size());
@@ -611,6 +764,16 @@ PackResult Packer::pack(const FloorplanInstance& inst, BTree& tree) const {
     // After this, one more compact_left_down catches any new floaters.
     holes_fill_pass(inst, tree);
     compact_left_down(inst, tree);
+
+    // ---- Soft-constraint repair (deterministic fixers) ------------------
+    // Compaction above scatters cluster members and pulls TOP/RIGHT boundary
+    // blocks off their edge every pass.  Repair both deterministically, LAST,
+    // so the compaction sweeps don't immediately undo them.  Grouping first,
+    // boundary second (boundary gets the final say on any shared block; in
+    // practice grouping skips boundary-constrained members).  See each pass's
+    // header for the full rationale.
+    grouping_repair_pass(inst, tree);
+    boundary_repair_pass(inst, tree);
 
     // Re-compute the bbox after compaction (it can only shrink).
     bbox_w_max = 0.0;
