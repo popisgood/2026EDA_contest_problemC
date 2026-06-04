@@ -243,6 +243,41 @@ class FloorSetLiteDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index)
 
+    def block_counts(self, cache: bool = True, verbose: bool = True) -> torch.Tensor:
+        """Per-case block count as an int tensor of length len(self).
+
+        Used for size-weighted sampling so the model spends more capacity on
+        the large cases (which dominate the v10 contest score).  For the
+        ~1M-case TRAIN format this scans every file once (a few minutes) and
+        caches the result to <root>/.block_counts_<N>.pt; later runs load it
+        instantly.
+        """
+        cache_path = self.root / f".block_counts_{len(self)}.pt"
+        if cache and cache_path.exists():
+            counts = torch.load(cache_path)
+            if int(counts.numel()) == len(self):
+                if verbose:
+                    print(f"[dataset] loaded cached block counts from {cache_path}")
+                return counts
+
+        if verbose:
+            print(f"[dataset] scanning {len(self.files)} files for block counts "
+                  f"(one-time; cached afterwards)...")
+        counts = torch.zeros(len(self), dtype=torch.int32)
+        for idx, (fi, ci) in enumerate(self.index):
+            self._load_file(fi)              # cached: each file is loaded once
+            if self.format == self.FORMAT_TRAIN:
+                counts[idx] = int(self._cache_data[0][ci].shape[0])
+            else:
+                counts[idx] = int(self._cache_data[ci][0].shape[0])
+            if verbose and idx % 50000 == 0 and idx > 0:
+                print(f"  ...{idx}/{len(self)} cases", flush=True)
+        if cache:
+            torch.save(counts, cache_path)
+            if verbose:
+                print(f"[dataset] cached block counts -> {cache_path}")
+        return counts
+
     def _load_file(self, fi: int):
         if fi == self._cache_fi:
             return
