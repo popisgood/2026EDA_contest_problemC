@@ -1,0 +1,266 @@
+"""Analytical / electrostatic-style global placement for FloorSet (Problem C).
+
+Continuous, gradient-based global placement (the DREAMPlace / ePlace paradigm)
+specialised for small FloorSet instances (n <= 120):
+
+    minimise  WL  +  lam_ov*Overlap  +  lam_bb*BBoxArea
+            +  lam_grp*Grouping  +  lam_bnd*Boundary
+
+  * WL       : weighted L1 (Manhattan) centroid distance over b2b/p2b edges
+               (matches the contest HPWL).
+  * Overlap  : sum of pairwise differentiable overlap-area (the spreading force).
+  * BBoxArea : compactness penalty.
+  * Grouping : pull each cluster's members toward their common centroid so they
+               end up abutting (soft-constraint V_grouping).
+  * Boundary : pull each boundary block's required edge to the layout extreme
+               (soft-constraint V_boundary).
+
+Hard constraints handled by construction:
+  * soft block area : exact, via shape = (sqrt(a)*exp(la/2), sqrt(a)*exp(-la/2)).
+  * MIB same-shape  : members of a MIB group SHARE one log-aspect AND one (mean)
+                      area, so they get byte-identical (w,h)  -> V_mib = 0.
+  * fixed           : w,h locked to target; position free.
+  * preplaced       : w,h and position locked; a static obstacle.
+"""
+from __future__ import annotations
+
+import torch
+
+
+def _valid(t, pad: float = -1.0):
+    if t is None or t.numel() == 0:
+        return None
+    r = t[t[:, 0] != pad]
+    return r if r.numel() > 0 else None
+
+
+def place(
+    block_count: int,
+    area_targets: torch.Tensor,
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+    constraints: torch.Tensor,
+    target_positions=None,
+    iters: int = 600,
+    lr: float = 0.02,
+    seed: int = 0,
+    device: str = "cpu",
+):
+    N = int(block_count)
+    if N == 0:
+        return [], {}
+    dev = torch.device(device)
+
+    a = area_targets[:N].float().to(dev).clamp(min=1e-9)
+    cons = constraints[:N].to(dev)
+    ncol = cons.shape[1]
+    is_fixed = cons[:, 0] != 0
+    is_pre = cons[:, 1] != 0
+    is_soft = ~(is_fixed | is_pre)
+    mib_id = cons[:, 2].long() if ncol > 2 else torch.zeros(N, dtype=torch.long, device=dev)
+    clust_id = cons[:, 3].long() if ncol > 3 else torch.zeros(N, dtype=torch.long, device=dev)
+    bcode = cons[:, 4].long() if ncol > 4 else torch.zeros(N, dtype=torch.long, device=dev)
+
+    if target_positions is not None and target_positions.numel() > 0:
+        tp = target_positions[:N].float().to(dev)
+    else:
+        tp = torch.full((N, 4), -1.0, device=dev)
+
+    S = float(torch.sqrt(a.sum()).item()) or 1.0
+    an = a / (S * S)
+    sqrt_an = torch.sqrt(an)   # per-block, so EVERY block keeps its exact area
+
+    tw = (tp[:, 2] / S).clamp(min=0.0)
+    th = (tp[:, 3] / S).clamp(min=0.0)
+    pre_cx = tp[:, 0] / S + 0.5 * tw
+    pre_cy = tp[:, 1] / S + 0.5 * th
+
+    # ---- MIB shape-groups: members share one (la, area) -> identical (w,h) ----
+    sg = torch.arange(N, device=dev)
+    gmax = int(mib_id.max().item()) if mib_id.numel() else 0
+    for g in range(1, gmax + 1):
+        mem = (mib_id == g).nonzero().flatten()
+        if mem.numel() > 0:
+            sg[mem] = mem[0]
+    _, inv = torch.unique(sg, return_inverse=True)
+    K = int(inv.max().item()) + 1
+    cnt_sg = torch.zeros(K, device=dev).index_add_(0, inv, torch.ones(N, device=dev))
+    area_sg = torch.zeros(K, device=dev).index_add_(0, inv, an) / cnt_sg.clamp(min=1.0)
+    sqrt_area_sg = torch.sqrt(area_sg.clamp(min=1e-12))
+
+    # ---- cluster membership matrix (constant) for grouping centroids ----
+    Gc = int(clust_id.max().item()) if clust_id.numel() else 0
+    if Gc > 0:
+        Mc = torch.zeros(Gc, N, device=dev)
+        for g in range(1, Gc + 1):
+            mem = (clust_id == g).nonzero().flatten()
+            if mem.numel() > 0:
+                Mc[g - 1, mem] = 1.0 / mem.numel()
+        has_clust = clust_id > 0
+        gi = (clust_id[has_clust] - 1)
+        n_clust_mem = max(1, int(has_clust.sum().item()))
+
+    Lb = (bcode & 1) > 0
+    Rb = (bcode & 2) > 0
+    Tb = (bcode & 4) > 0
+    Bb = (bcode & 8) > 0
+
+    # ---- parameters ----
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    cx = torch.rand(N, generator=gen, device=dev)
+    cy = torch.rand(N, generator=gen, device=dev)
+    cx = torch.where(is_pre, pre_cx, cx).clone().requires_grad_(True)
+    cy = torch.where(is_pre, pre_cy, cy).clone().requires_grad_(True)
+    la = torch.zeros(K, device=dev, requires_grad=True)   # one log-aspect per shape-group
+
+    AR_CAP = 4.0
+    la_cap = float(torch.log(torch.tensor(AR_CAP)))
+
+    eb = _valid(b2b_connectivity)
+    ep = _valid(p2b_connectivity)
+    pv = None
+    if pins_pos is not None and pins_pos.numel() > 0:
+        pv = pins_pos[pins_pos[:, 0] != -1].float().to(dev) / S
+    if eb is not None:
+        ia = eb[:, 0].long().clamp(0, N - 1)
+        ib = eb[:, 1].long().clamp(0, N - 1)
+        wb = eb[:, 2].float().to(dev)
+    if ep is not None and pv is not None and pv.shape[0] > 0:
+        et = ep[:, 0].long().clamp(0, pv.shape[0] - 1)
+        ebk = ep[:, 1].long().clamp(0, N - 1)
+        wp = ep[:, 2].float().to(dev)
+        tx, ty = pv[et, 0], pv[et, 1]
+    else:
+        ep = None
+    total_w = 1.0 + (float(wb.sum()) if eb is not None else 0.0) + (float(wp.sum()) if ep is not None else 0.0)
+
+    triu = torch.triu_indices(N, N, offset=1, device=dev)
+    ti, tj = triu[0], triu[1]
+
+    def shapes(la_):
+        # Aspect ratio is shared within a MIB group (la is per shape-group);
+        # AREA is always per-block exact (sqrt_an), so the hard area constraint
+        # is never violated.  Equal-area MIB members -> identical (w,h); members
+        # with unequal target areas keep their own area (V_mib may be > 0, but
+        # area stays feasible -- hard constraint beats the soft one).
+        la_b = la_.clamp(-la_cap, la_cap)
+        # Shape from the MIB-group's COMMON area (matched instances share area),
+        # so members get identical (w,h) -> V_mib = 0 and tighter packing.
+        w_soft = (sqrt_area_sg * torch.exp(0.5 * la_b))[inv]
+        h_soft = (sqrt_area_sg * torch.exp(-0.5 * la_b))[inv]
+        w = torch.where(is_soft, w_soft, torch.where(is_fixed | is_pre, tw, w_soft))
+        h = torch.where(is_soft, h_soft, torch.where(is_fixed | is_pre, th, h_soft))
+        return w, h
+
+    opt = torch.optim.Adam([cx, cy, la], lr=lr)
+
+    for it in range(iters):
+        opt.zero_grad()
+        w, h = shapes(la)
+        ecx = torch.where(is_pre, pre_cx, cx)
+        ecy = torch.where(is_pre, pre_cy, cy)
+
+        wl = ecx.new_zeros(())
+        if eb is not None:
+            wl = wl + (wb * ((ecx[ia] - ecx[ib]).abs() + (ecy[ia] - ecy[ib]).abs())).sum()
+        if ep is not None:
+            wl = wl + (wp * ((tx - ecx[ebk]).abs() + (ty - ecy[ebk]).abs())).sum()
+        wl = wl / total_w
+
+        dx = (ecx[ti] - ecx[tj]).abs()
+        dy = (ecy[ti] - ecy[tj]).abs()
+        ov = (torch.relu(0.5 * (w[ti] + w[tj]) - dx) * torch.relu(0.5 * (h[ti] + h[tj]) - dy)).sum()
+
+        left = (ecx - 0.5 * w).min(); right = (ecx + 0.5 * w).max()
+        bot = (ecy - 0.5 * h).min(); top = (ecy + 0.5 * h).max()
+        bbox = (right - left) * (top - bot)
+
+        grp = ecx.new_zeros(())
+        if Gc > 0:
+            gcx = Mc @ ecx
+            gcy = Mc @ ecy
+            grp = (((ecx[has_clust] - gcx[gi]).abs()
+                    + (ecy[has_clust] - gcy[gi]).abs()).sum()) / n_clust_mem
+
+        bnd = ecx.new_zeros(())
+        xmn, xmx = left.detach(), right.detach()
+        ymn, ymx = bot.detach(), top.detach()
+        if Lb.any():
+            bnd = bnd + ((ecx[Lb] - 0.5 * w[Lb]) - xmn).abs().sum()
+        if Rb.any():
+            bnd = bnd + ((ecx[Rb] + 0.5 * w[Rb]) - xmx).abs().sum()
+        if Tb.any():
+            bnd = bnd + ((ecy[Tb] + 0.5 * h[Tb]) - ymx).abs().sum()
+        if Bb.any():
+            bnd = bnd + ((ecy[Bb] - 0.5 * h[Bb]) - ymn).abs().sum()
+        bnd = bnd / N
+
+        frac = it / max(1, iters - 1)
+        # Keep the layout TIGHT: the legalizer cleans up small residual overlap,
+        # so we don't ramp the spreading force so high that blocks over-disperse
+        # (which inflates HPWL and bbox area).  A modest final lam_ov leaves a
+        # little overlap for the legalizer and keeps wirelength/area low.
+        lam_ov = 0.1 + 2.4 * frac
+        lam_bb = 0.20 * (1.0 - frac) + 0.04
+        lam_grp = 0.2 + 1.6 * frac
+        lam_bnd = 0.2 + 1.6 * frac
+
+        loss = wl + lam_ov * ov + lam_bb * bbox + lam_grp * grp + lam_bnd * bnd
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        w, h = shapes(la)
+        ecx = torch.where(is_pre, pre_cx, cx)
+        ecy = torch.where(is_pre, pre_cy, cy)
+        x = (ecx - 0.5 * w) * S
+        y = (ecy - 0.5 * h) * S
+        W = w * S
+        H = h * S
+        # Output EXACT target geometry for locked blocks (avoids float round-trip
+        # drift through the /S*S normalisation, which could shift a pinned
+        # preplaced block by ~1e-5 and create a micro-overlap the contest flags).
+        ispre_l = is_pre.cpu().tolist()
+        isfix_l = is_fixed.cpu().tolist()
+        tpl = tp.cpu().tolist()
+        out = []
+        for i in range(N):
+            if ispre_l[i]:
+                out.append((tpl[i][0], tpl[i][1], tpl[i][2], tpl[i][3]))
+            elif isfix_l[i]:
+                out.append((float(x[i]), float(y[i]), tpl[i][2], tpl[i][3]))
+            else:
+                out.append((float(x[i]), float(y[i]), float(W[i]), float(H[i])))
+        diag = _measure(x, y, W, H, eb, ep,
+                        (tx * S, ty * S) if ep is not None else None,
+                        ia if eb is not None else None, ib if eb is not None else None,
+                        wb if eb is not None else None,
+                        ebk if ep is not None else None, wp if ep is not None else None, a)
+    return out, diag
+
+
+@torch.no_grad()
+def _measure(x, y, W, H, eb, ep, term_xy, ia, ib, wb, ebk, wp, a):
+    cx = x + 0.5 * W
+    cy = y + 0.5 * H
+    hpwl = 0.0
+    if eb is not None:
+        hpwl += float((wb * ((cx[ia] - cx[ib]).abs() + (cy[ia] - cy[ib]).abs())).sum())
+    if ep is not None:
+        tx, ty = term_xy
+        hpwl += float((wp * ((tx - cx[ebk]).abs() + (ty - cy[ebk]).abs())).sum())
+    N = x.shape[0]
+    tri = torch.triu_indices(N, N, offset=1)
+    i, j = tri[0], tri[1]
+    ox = torch.relu(0.5 * (W[i] + W[j]) - (cx[i] - cx[j]).abs())
+    oy = torch.relu(0.5 * (H[i] + H[j]) - (cy[i] - cy[j]).abs())
+    total_area = float(a.sum())
+    bbox = float((x + W).max() - x.min()) * float((y + H).max() - y.min())
+    return {
+        "hpwl": hpwl,
+        "overlap_pct": 100.0 * float((ox * oy).sum()) / max(total_area, 1e-9),
+        "bbox_area": bbox,
+        "total_block_area": total_area,
+        "bbox_util_pct": 100.0 * total_area / max(bbox, 1e-9),
+    }
