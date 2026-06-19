@@ -24,6 +24,8 @@ Hard constraints handled by construction:
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 
@@ -32,6 +34,20 @@ def _valid(t, pad: float = -1.0):
         return None
     r = t[t[:, 0] != pad]
     return r if r.numel() > 0 else None
+
+
+def _sabs(d, g):
+    """Smooth differentiable |d| = sqrt(d^2 + g^2)  (g==0 -> exact abs).
+
+    The raw L1 abs has a +/-1 subgradient with a kink at 0, so the wirelength
+    term keeps jittering near convergence (Adam never sees curvature).  The
+    g-smoothing gives a gradient d/sqrt(d^2+g^2) that shrinks to 0 as d->0, so
+    connected centroids settle precisely on top of each other -- the smooth /
+    weighted-average wirelength idea behind ePlace and DREAMPlace.  g is annealed
+    toward 0 over the run so the final wirelength matches the true HPWL metric."""
+    if g <= 0.0:
+        return d.abs()
+    return torch.sqrt(d * d + g * g)
 
 
 def place(
@@ -46,11 +62,27 @@ def place(
     lr: float = 0.02,
     seed: int = 0,
     device: str = "cpu",
+    init_centers=None,
 ):
     N = int(block_count)
     if N == 0:
         return [], {}
     dev = torch.device(device)
+
+    wl_smooth = float(os.environ.get("ELECTRO_WL_SMOOTH", "0"))  # 0 = exact L1
+    # Module-area-growing: soft blocks start at 10% area and reach exact area by
+    # 70% of the run.  Big win (full-100 3.545 -> 2.745) -- the shrunk blocks pack
+    # into a tight outline before filling out, cutting area_gap and HPWL.
+    area_grow0 = float(os.environ.get("ELECTRO_AREA_GROW", "0.1"))  # 1.0 = off
+    grow_end = float(os.environ.get("ELECTRO_GROW_END", "0.7"))     # frac at full area
+    ov0 = float(os.environ.get("ELECTRO_OV0", "0.1"))   # overlap penalty start
+    ov1 = float(os.environ.get("ELECTRO_OV1", "2.5"))   # overlap penalty end
+    bb0 = float(os.environ.get("ELECTRO_BB0", "0.24"))  # bbox penalty start
+    bb1 = float(os.environ.get("ELECTRO_BB1", "0.04"))  # bbox penalty end
+    # Fixed-outline containment pull -> denser packing, lower area_gap
+    # (subset 2.604 -> 2.537).  0 = off.
+    lam_out = float(os.environ.get("ELECTRO_LAM_OUT", "2.0"))
+    target_util = float(os.environ.get("ELECTRO_TARGET_UTIL", "0.85"))
 
     a = area_targets[:N].float().to(dev).clamp(min=1e-9)
     cons = constraints[:N].to(dev)
@@ -108,8 +140,21 @@ def place(
 
     # ---- parameters ----
     gen = torch.Generator(device=dev).manual_seed(seed)
-    cx = torch.rand(N, generator=gen, device=dev)
-    cy = torch.rand(N, generator=gen, device=dev)
+    if init_centers is not None:
+        # ML warm-start: use the Transformer's predicted (cx, cy) -- given in raw
+        # coords, so normalise by S -- as the gradient-descent starting point.
+        # seed 0 = the pure prediction; further seeds jitter it for multi-start
+        # diversity while staying in the good basin the model points to.
+        ic = init_centers.to(dev).float()
+        cx = ic[:, 0] / S
+        cy = ic[:, 1] / S
+        if seed != 0:
+            j = float(os.environ.get("ELECTRO_ML_JITTER", "0.15"))
+            cx = cx + j * torch.randn(N, generator=gen, device=dev)
+            cy = cy + j * torch.randn(N, generator=gen, device=dev)
+    else:
+        cx = torch.rand(N, generator=gen, device=dev)
+        cy = torch.rand(N, generator=gen, device=dev)
     cx = torch.where(is_pre, pre_cx, cx).clone().requires_grad_(True)
     cy = torch.where(is_pre, pre_cy, cy).clone().requires_grad_(True)
     la = torch.zeros(K, device=dev, requires_grad=True)   # one log-aspect per shape-group
@@ -138,34 +183,48 @@ def place(
     triu = torch.triu_indices(N, N, offset=1, device=dev)
     ti, tj = triu[0], triu[1]
 
-    def shapes(la_):
+    def shapes(la_, ascale=1.0):
         # Aspect ratio is shared within a MIB group (la is per shape-group);
         # AREA is always per-block exact (sqrt_an), so the hard area constraint
         # is never violated.  Equal-area MIB members -> identical (w,h); members
         # with unequal target areas keep their own area (V_mib may be > 0, but
         # area stays feasible -- hard constraint beats the soft one).
         la_b = la_.clamp(-la_cap, la_cap)
-        # Shape from the MIB-group's COMMON area (matched instances share area),
-        # so members get identical (w,h) -> V_mib = 0 and tighter packing.
-        w_soft = (sqrt_area_sg * torch.exp(0.5 * la_b))[inv]
-        h_soft = (sqrt_area_sg * torch.exp(-0.5 * la_b))[inv]
+        # Module-area-growing (ascale<1 early -> 1.0 at output): soft blocks start
+        # shrunk so they slip into gaps and the layout packs into a tight outline,
+        # then grow to exact area (the fixed-outline rectilinear-soft-module idea).
+        # Only soft blocks grow; fixed/preplaced obstacles stay full size.
+        sg_scale = ascale ** 0.5
+        w_soft = (sqrt_area_sg * torch.exp(0.5 * la_b))[inv] * sg_scale
+        h_soft = (sqrt_area_sg * torch.exp(-0.5 * la_b))[inv] * sg_scale
         w = torch.where(is_soft, w_soft, torch.where(is_fixed | is_pre, tw, w_soft))
         h = torch.where(is_soft, h_soft, torch.where(is_fixed | is_pre, th, h_soft))
         return w, h
 
-    opt = torch.optim.Adam([cx, cy, la], lr=lr)
+    opt_name = os.environ.get("ELECTRO_OPT", "adam").lower()
+    if opt_name == "nesterov":
+        # ePlace-style accelerated gradient (SGD + Nesterov momentum).  Needs a
+        # larger lr than Adam since it has no per-parameter scaling.
+        opt = torch.optim.SGD([cx, cy, la], lr=lr, momentum=0.9, nesterov=True)
+    else:
+        opt = torch.optim.Adam([cx, cy, la], lr=lr)
 
     for it in range(iters):
         opt.zero_grad()
-        w, h = shapes(la)
+        frac = it / max(1, iters - 1)
+        g_wl = wl_smooth * (1.0 - 0.9 * frac)   # anneal the WL smoothing -> 0
+        # grow soft-block area from area_grow0 up to 1.0 by frac == grow_end
+        area_scale = min(1.0, area_grow0 + (1.0 - area_grow0) * (frac / max(grow_end, 1e-6)))
+
+        w, h = shapes(la, area_scale)
         ecx = torch.where(is_pre, pre_cx, cx)
         ecy = torch.where(is_pre, pre_cy, cy)
 
         wl = ecx.new_zeros(())
         if eb is not None:
-            wl = wl + (wb * ((ecx[ia] - ecx[ib]).abs() + (ecy[ia] - ecy[ib]).abs())).sum()
+            wl = wl + (wb * (_sabs(ecx[ia] - ecx[ib], g_wl) + _sabs(ecy[ia] - ecy[ib], g_wl))).sum()
         if ep is not None:
-            wl = wl + (wp * ((tx - ecx[ebk]).abs() + (ty - ecy[ebk]).abs())).sum()
+            wl = wl + (wp * (_sabs(tx - ecx[ebk], g_wl) + _sabs(ty - ecy[ebk], g_wl))).sum()
         wl = wl / total_w
 
         dx = (ecx[ti] - ecx[tj]).abs()
@@ -175,6 +234,21 @@ def place(
         left = (ecx - 0.5 * w).min(); right = (ecx + 0.5 * w).max()
         bot = (ecy - 0.5 * h).min(); top = (ecy + 0.5 * h).max()
         bbox = (right - left) * (top - bot)
+
+        # Fixed-outline containment: pull every block edge inside a target square
+        # of side L = sqrt(total_area / util) centred on the layout, forcing dense
+        # packing (raise util -> shrink the box -> cut area_gap).  Normalised total
+        # block area == 1, so L = sqrt(1/util).  (PeF / fixed-outline FP idea.)
+        out = ecx.new_zeros(())
+        if lam_out > 0.0:
+            hL = 0.5 / (target_util ** 0.5)
+            gx = ((left + right) * 0.5).detach()
+            gy = ((bot + top) * 0.5).detach()
+            ex = (torch.relu((ecx + 0.5 * w) - (gx + hL))
+                  + torch.relu((gx - hL) - (ecx - 0.5 * w)))
+            ey = (torch.relu((ecy + 0.5 * h) - (gy + hL))
+                  + torch.relu((gy - hL) - (ecy - 0.5 * h)))
+            out = (ex + ey).sum() / N
 
         grp = ecx.new_zeros(())
         if Gc > 0:
@@ -196,17 +270,16 @@ def place(
             bnd = bnd + ((ecy[Bb] - 0.5 * h[Bb]) - ymn).abs().sum()
         bnd = bnd / N
 
-        frac = it / max(1, iters - 1)
         # Keep the layout TIGHT: the legalizer cleans up small residual overlap,
         # so we don't ramp the spreading force so high that blocks over-disperse
         # (which inflates HPWL and bbox area).  A modest final lam_ov leaves a
         # little overlap for the legalizer and keeps wirelength/area low.
-        lam_ov = 0.1 + 2.4 * frac
-        lam_bb = 0.20 * (1.0 - frac) + 0.04
+        lam_ov = ov0 + (ov1 - ov0) * frac
+        lam_bb = bb0 + (bb1 - bb0) * frac
         lam_grp = 0.2 + 1.6 * frac
         lam_bnd = 0.2 + 1.6 * frac
 
-        loss = wl + lam_ov * ov + lam_bb * bbox + lam_grp * grp + lam_bnd * bnd
+        loss = wl + lam_ov * ov + lam_bb * bbox + lam_grp * grp + lam_bnd * bnd + lam_out * out
         loss.backward()
         opt.step()
 

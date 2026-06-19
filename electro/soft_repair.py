@@ -32,8 +32,13 @@ def _free(idx, nx, ny, x, y, w, h, ignore=None):
 
 
 def _slot_along_y(i, X, x, y, w, h, ymn, ymx):
-    """Fix block i's x to X; find a y in [ymn, ymx-h_i] where it's free."""
-    wi, hi = w[i], X + w[i]
+    """Fix block i's x to X; find the NEAREST free y in [ymn, ymx-h_i].
+
+    Min-displacement: among the discrete candidate slots (stay, the two wall
+    ends, and the tight-pack positions just above/below each column neighbour)
+    pick the free one closest to the block's current y -- this keeps the
+    boundary block on its wall while moving it as little as possible, so
+    satisfying the boundary constraint costs the least possible wirelength."""
     R = X + w[i]
     cands = [y[i], ymn, ymx - h[i]]
     for j in range(len(x)):
@@ -42,14 +47,17 @@ def _slot_along_y(i, X, x, y, w, h, ymn, ymx):
         if x[j] < R - _EPS and X < x[j] + w[j] - _EPS:    # shares the column
             cands.append(y[j] + h[j])                      # above j
             cands.append(y[j] - h[i])                      # below j
-    for yy in sorted(set(c for c in cands if ymn - _EPS <= c <= ymx - h[i] + _EPS)):
+    valid = sorted({c for c in cands if ymn - _EPS <= c <= ymx - h[i] + _EPS},
+                   key=lambda c: abs(c - y[i]))
+    for yy in valid:
         if _free(i, X, yy, x, y, w, h):
             return yy
     return None
 
 
 def _slot_along_x(i, Y, x, y, w, h, xmn, xmx):
-    """Fix block i's y to Y; find an x in [xmn, xmx-w_i] where it's free."""
+    """Fix block i's y to Y; find the NEAREST free x in [xmn, xmx-w_i]
+    (min-displacement; mirror of _slot_along_y)."""
     T = Y + h[i]
     cands = [x[i], xmn, xmx - w[i]]
     for j in range(len(x)):
@@ -58,7 +66,9 @@ def _slot_along_x(i, Y, x, y, w, h, xmn, xmx):
         if y[j] < T - _EPS and Y < y[j] + h[j] - _EPS:    # shares the row
             cands.append(x[j] + w[j])
             cands.append(x[j] - w[i])
-    for xx in sorted(set(c for c in cands if xmn - _EPS <= c <= xmx - w[i] + _EPS)):
+    valid = sorted({c for c in cands if xmn - _EPS <= c <= xmx - w[i] + _EPS},
+                   key=lambda c: abs(c - x[i]))
+    for xx in valid:
         if _free(i, xx, Y, x, y, w, h):
             return xx
     return None
@@ -196,23 +206,26 @@ def grouping_repair(x, y, w, h, clust_id, is_pre, passes=4):
                 for i in comp:
                     if is_pre[i]:
                         continue
-                    placed = False
-                    for s in main:         # try to abut i to a main-component sibling
-                        cands = [
+                    # Min-displacement: among every free abut slot against a
+                    # main-component sibling, pick the one nearest i's current
+                    # position (Manhattan = the HPWL metric) so reconnecting the
+                    # cluster perturbs wirelength as little as possible.
+                    best, best_d = None, None
+                    for s in main:
+                        for nx, ny in (
                             (x[s] - w[i], y[s]),            # left of s
                             (x[s] + w[s], y[s]),            # right of s
                             (x[s], y[s] - h[i]),            # below s
                             (x[s], y[s] + h[s]),            # above s
-                        ]
-                        for nx, ny in cands:
+                        ):
                             if _free(i, nx, ny, x, y, w, h):
-                                x[i], y[i] = nx, ny
-                                main.add(i)
-                                placed = True
-                                any_move = True
-                                break
-                        if placed:
-                            break
+                                d = abs(nx - x[i]) + abs(ny - y[i])
+                                if best_d is None or d < best_d:
+                                    best, best_d = (nx, ny), d
+                    if best is not None:
+                        x[i], y[i] = best
+                        main.add(i)
+                        any_move = True
         if not any_move:
             break
     return x, y
