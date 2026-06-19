@@ -44,12 +44,15 @@ beats random s8 (2.24): same quality, fewer seeds = less time.  Model trained on
 - + multi-start(3):    2.6911 -> 2.5407
 - + ML-init + s8 + parallel: (pending)
 
-## Runtime finding (IMPORTANT)
-place() is dispatch-bound, not compute-bound: ~13-17s/seed on the WSL CPU box and
-nearly INDEPENDENT of n (n=31 13.6s vs n=120 16.9s) -- it's 600 iters x ~15 tiny
-torch ops x autograd.  A minimal 600-iter torch loop is already 3.5s on this box.
-Consequences: extra threads barely help; the WSL CPU box is NOT representative of the
-eval machine (native Linux + A100).
+## Runtime finding (IMPORTANT) -- root cause of the "got 6x slower" scare
+The slowdown (~2s/seed -> ~13s/seed) was a BUG I introduced: a GPU auto-detect
+(`device = cuda if torch.cuda.is_available() else cpu`).  On a box where torch sees
+a CUDA GPU it routed this TINY problem (n<=120, 600 sequential small ops) to the GPU,
+where kernel-launch overhead makes it ~6x SLOWER than CPU -- and on a laptop it ran
+on the display GPU and froze the screen.  FIX: default device=cpu.  CPU per-seed:
+~2s (place() ~1.6-2.1s, repair <2ms).  GPU only pays off with seed-BATCHING (TODO).
+Measured: place() OLD 1.64s vs NEW 2.11s (the +0.5s is area-grow + fixed-outline,
+not a regression); full solve() on cpu ~2s/seed, on cuda ~12s/seed.
 
 CPU fork-parallelism (electro_parallel.py) was a DEAD END: forked workers oversubscribe
 the OpenMP runtime (N workers x M threads -> e.g. n=31 took 97s), and multi-thread

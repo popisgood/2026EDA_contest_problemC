@@ -61,11 +61,12 @@ class MyOptimizer(FloorplanOptimizer):
     def __init__(self, verbose: bool = False):
         super().__init__(verbose=verbose)
         self.iters = int(os.environ.get("ELECTRO_ITERS", "600"))
-        # Auto-use the GPU when present (the eval box has an A100): this placer is
-        # a DREAMPlace-style torch optimizer, so CUDA gives a large speedup and
-        # makes runtime a non-issue.  Falls back to CPU when no GPU is available.
-        self.device = os.environ.get(
-            "ELECTRO_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+        # CPU by default.  This is a SMALL problem (n<=120) run for 600 sequential
+        # iterations of tiny ops, so a GPU is ~6x SLOWER here (kernel-launch
+        # overhead dominates) -- and on a laptop it would run on the display GPU
+        # and freeze the screen.  GPU only pays off with seed-BATCHING (TODO);
+        # opt in then with ELECTRO_DEVICE=cuda.
+        self.device = os.environ.get("ELECTRO_DEVICE", "cpu")
         self.lr = float(os.environ.get("ELECTRO_LR", "0.02"))
         # Rounds of (grouping_repair -> boundary_snap).  Each repair is now
         # min-displacement, but the two fight over blocks that are both a cluster
