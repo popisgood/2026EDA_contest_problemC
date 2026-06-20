@@ -74,11 +74,12 @@ class MyOptimizer(FloorplanOptimizer):
         # snapped off their cluster.  Iterating lets them settle: full-100 score
         # 3.733 (1 round) -> 3.568 (2) -> 3.545 (3) -> 3.545 (4, saturated).
         self.repair_rounds = int(os.environ.get("ELECTRO_REPAIR_ROUNDS", "3"))
-        # Multi-start: keep the best of N seeds (ranked by an in-case cost proxy).
-        # More seeds -> lower score; with ML warm-start, subset 3->2.16, 5->2.11,
-        # 8->2.07.  Sequential here (3 = sane runtime); the cheap way to many seeds
-        # is GPU + seed-batching, not CPU fork (which oversubscribes OpenMP).
-        self.seeds = int(os.environ.get("ELECTRO_SEEDS", "3"))
+        # Multi-start: keep the best of N seeds.  More seeds -> lower quality score
+        # (subset 1->2.54, 3->2.16, 8->2.07 with ML) but ~Nx runtime.  The contest
+        # runtime penalty (R^0.3, UNCAPPED on the slow side) usually makes seeds=1
+        # win the runtime-adjusted total unless the field's median runtime is very
+        # high.  Default 1 (fast); raise it when runtime is cheap / median is high.
+        self.seeds = int(os.environ.get("ELECTRO_SEEDS", "1"))
         # Multi-start seeds in parallel fork processes.  OFF by default: on CPU
         # the place loop is dispatch/OpenMP-bound, and forked workers oversubscribe
         # the OpenMP runtime (N workers x M threads); the real seed-batching speedup
@@ -111,9 +112,13 @@ class MyOptimizer(FloorplanOptimizer):
         bcode = cons[:, 4].astype(int) if cons.shape[1] > 4 else np.zeros(block_count, int)
         eb, ep, pv = _edges_np(b2b_connectivity, p2b_connectivity, pins_pos, block_count)
 
+        # ML warm-start only helps WITH multi-start (jitter around the prediction);
+        # a single pure-ML start is worse than a single random start, so for
+        # seeds==1 we use random init.
+        use_ml = self.ml_init and self.seeds > 1
         init_centers = self._ml_centers(
             block_count, area_targets, constraints, target_positions,
-            b2b_connectivity, p2b_connectivity, pins_pos) if self.ml_init else None
+            b2b_connectivity, p2b_connectivity, pins_pos) if use_ml else None
 
         nseeds = max(1, self.seeds)
         P = {
@@ -122,6 +127,7 @@ class MyOptimizer(FloorplanOptimizer):
             "tp": target_positions, "iters": self.iters, "lr": self.lr,
             "device": self.device, "init": init_centers, "is_pre": is_pre,
             "clust_id": clust_id, "bcode": bcode, "rounds": self.repair_rounds,
+            "nonneg": os.environ.get("ELECTRO_NONNEG", "0") == "1",
         }
 
         # Multi-start: each seed lands in a different basin; run them in parallel

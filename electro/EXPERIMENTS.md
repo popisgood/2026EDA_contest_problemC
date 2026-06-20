@@ -30,7 +30,37 @@ Baseline at sprint start (min-displacement repairs + 3 iterate rounds):
 | T5| fixed-outline containment (#5,#6) | LAM_OUT=2.0 UTIL=0.85      | 2.5373 | ACCEPT |
 | T7| multi-start keep-best (proxy rank)| SEEDS 3/5/8/12             | 2.42/2.31/2.24/2.10 | ACCEPT |
 | T2| Nesterov (naive SGD) (#1,#8)      | OPT=nesterov lr 0.04/0.1   | 3.48/2.87 | REJECT (Adam wins) |
-| T8| ML warm-start init (FloorplanTfmr)| ML_INIT=1 (+ jitter)       | s1 2.78 / s3 2.16 / s5 2.11 / s8 2.07 | ACCEPT |
+| T8| ML warm-start init (FloorplanTfmr)| ML_INIT=1 (+ jitter)       | s1 2.78 / s3 2.16 / s5 2.11 / s8 2.07 | ACCEPT (multi-start only) |
+| T9| canvas clamp / first-quadrant wall| CLAMP=1                    | 2.81 | REJECT (over-constrains; -score) |
+| T10| external (pin) WL weight (#7)     | EXT_WL 3/8/11/14/25        | 2.41/2.34/2.300/2.32/2.71 | ACCEPT (=10) |
+
+EXT_WL detail: boosting the pin/terminal wirelength pull drags pin-connected blocks
+onto their fixed terminals -> lower HPWLext, and anchors the layout to the positive
+terminal frame (partly fixing the negative-coord drift WITHOUT the clamp's score cost).
+Smooth basin ~8-18, overshoot >=25.  Default 10.
+
+## Negative coordinates -- the current solution DOES place blocks at x<0 / y<0
+The layout drifts into the negative quadrant (worst corner ~ -40 to -77 before EXT_WL,
+smaller after).  Official PDF says origin (0,0) = canvas lower-left, BUT the evaluate
+code's feasibility checks are only overlap / area-tol / fixed-dims / preplaced -- NOT
+non-negativity -- and HPWLint+area are translation-invariant.  So negative coords are
+FEASIBLE and don't change the local score; only HPWLext (distance to fixed terminals)
+is position-dependent (EXT_WL helps that).  Tried to force non-negativity:
+- Quadratic wall penalty (ELECTRO_WALL): smooth but force->0 at boundary -> always a
+  gap; WALL=5 helps score (2.30->2.18 subset) but breaks 1 case feasible (99/100) and
+  does NOT confine; WALL>=25 over-constrains.
+- Linear/L1 wall (ELECTRO_WALL_LIN): exact-penalty theory (constant force, finite
+  weight = exact) -- confines place() better than quadratic (final -13 vs -76) but
+  still not exact and already costs score (2.50 at w=20).
+- Wall-aware legalizer (ELECTRO_NONNEG, _push/_cleanup floor=0): GUARANTEES non-neg
+  output, but moving the negative-drifted bulk back wrecks grouping/boundary ->
+  subset 7.5 (V_rel ~ 1).  ALL 100 cases have a preplaced block, so a free rigid
+  translation is never available.
+Conclusion: forcing non-negativity is too costly here; root cause is global
+mis-positioning relative to the canvas.  The proper fix = eDensity FFT density field
+on [0,W]x[0,H] with Neumann BC (DREAMPlace fence-region style) -- confines the whole
+layout naturally; also the path to lower area_gap / the friend's ~1.07.  TODO, big.
+All of WALL / WALL_LIN / NONNEG / CLAMP are OFF by default (negative coords kept).
 
 ML-init detail: pure prediction as init (seed 0, no jitter) is WORSE than random
 (2.78 vs 2.54 at s1) -- the raw prediction sits in a mediocre basin.  But ML+jitter
@@ -70,7 +100,14 @@ Mild overfit risk only in the continuous constants (area_grow, lam_out, util, ji
 -- but tuned on 15 cases and confirmed on full-100 incl. the other 85 untuned cases,
 and the optima are broad plateaus.  Keep constants robust; don't razor-tune to open.
 
+## Seeds vs runtime (default seeds=1)
+Contest runtime penalty = max(0.7, R^0.3), R = your_time/median, UNCAPPED on the slow
+side.  More seeds -> lower quality but ~Nx time.  At median~1s: seeds=3 (7.7s) pays
+1.85x vs seeds=1 (2.7s) 1.34x, and the ~18% quality gain < the 38% extra penalty ->
+seeds=1 wins.  Crossover: if the field's median is very high (>~25s) both floor at 0.7
+and quality wins (raise seeds).  Default seeds=1 (ML auto-off; ML only helps multi-start).
+
 ## Config knobs (electro_optimizer.py / analytical_place.py defaults)
-ELECTRO_SEEDS=3  ELECTRO_PARALLEL=0  ELECTRO_ML_INIT=1  ELECTRO_REPAIR_ROUNDS=3
+ELECTRO_SEEDS=1  ELECTRO_PARALLEL=0  ELECTRO_ML_INIT=1  ELECTRO_REPAIR_ROUNDS=3
 ELECTRO_AREA_GROW=0.1 ELECTRO_GROW_END=0.7  ELECTRO_LAM_OUT=2.0 ELECTRO_TARGET_UTIL=0.85
-ELECTRO_ITERS=600 ELECTRO_LR=0.02 ELECTRO_OPT=adam ELECTRO_ML_JITTER=0.15
+ELECTRO_EXT_WL=10  ELECTRO_CLAMP=0  ELECTRO_ITERS=600 ELECTRO_LR=0.02 ELECTRO_ML_JITTER=0.15

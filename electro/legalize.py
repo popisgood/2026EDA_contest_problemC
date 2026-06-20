@@ -72,8 +72,12 @@ def _compact(pos, size, adj, coord, is_pre):
     return p
 
 
-def _push(c, i, j, move, size, is_pre):
-    """Separate i and j along axis `c` by `move`, never moving a pinned block."""
+def _push(c, i, j, move, size, is_pre, floor=None):
+    """Separate i and j along axis `c` by `move`, never moving a pinned block.
+
+    With `floor` set (the x=0 / y=0 canvas wall), the lower block's corner is
+    never pushed below it -- the wall acts like a fixed obstacle, so the excess
+    push is redirected to the higher block.  Keeps movable blocks non-negative."""
     ci = c[i] + 0.5 * size[i]
     cj = c[j] + 0.5 * size[j]
     lo, hi = (i, j) if ci <= cj else (j, i)
@@ -82,14 +86,23 @@ def _push(c, i, j, move, size, is_pre):
     if is_pre[lo]:
         c[hi] += move
     elif is_pre[hi]:
-        c[lo] -= move
+        c[lo] = max(c[lo] - move, floor) if floor is not None else c[lo] - move
+    elif floor is not None and c[lo] - 0.5 * move < floor:
+        slack = max(0.0, c[lo] - floor)   # how far the lower block may still drop
+        c[lo] -= slack
+        c[hi] += move - slack             # the wall absorbs the rest -> push hi
     else:
         c[lo] -= 0.5 * move
         c[hi] += 0.5 * move
 
 
-def _cleanup(x, y, w, h, is_pre, max_iter):
-    """Remove any residual overlap; guaranteed to finish overlap-free."""
+def _cleanup(x, y, w, h, is_pre, max_iter, floor=None):
+    """Remove any residual overlap; guaranteed to finish overlap-free.  With
+    `floor` set, movable blocks are also kept at corner >= floor (canvas walls)."""
+    if floor is not None:                     # start inside the walls
+        mv = ~is_pre
+        x[mv] = np.maximum(x[mv], floor)
+        y[mv] = np.maximum(y[mv], floor)
     for _ in range(max_iter):
         ii, jj = _overlap_pairs(x, y, w, h)
         if len(ii) == 0:
@@ -101,9 +114,9 @@ def _cleanup(x, y, w, h, is_pre, max_iter):
             if oxk <= 0 or oyk <= 0:
                 continue  # already cleared by an earlier push this pass
             if oxk <= oyk:
-                _push(x, i, j, oxk + _EPS, w, is_pre)
+                _push(x, i, j, oxk + _EPS, w, is_pre, floor)
             else:
-                _push(y, i, j, oyk + _EPS, h, is_pre)
+                _push(y, i, j, oyk + _EPS, h, is_pre, floor)
 
     # Last resort: evict whatever still overlaps to empty space above the layout
     # (stacked so evicted blocks can't overlap each other or anything below).
@@ -161,18 +174,25 @@ def legalize(x, y, w, h, is_pre, max_clean_iter=4000):
     return x, y
 
 
-def remove_overlap(x, y, w, h, is_pre, max_iter=4000):
+def remove_overlap(x, y, w, h, is_pre, max_iter=4000, nonneg=False):
     """Final safety net: drive any contest-counted overlap (both dims > 1e-6) to
     zero via the same push-apart/eviction backstop used inside legalize().  Run
-    AFTER the soft-constraint repairs, which can re-introduce micro-overlaps."""
+    AFTER the soft-constraint repairs, which can re-introduce micro-overlaps.
+
+    nonneg=True additionally enforces the canvas walls (every movable block's
+    lower-left corner >= 0) WHILE keeping zero overlap, so the output is
+    guaranteed in the first quadrant -- a local, min-displacement-style fix (no
+    global shift), only blocks that poked past a wall get nudged back."""
     x = np.asarray(x, float).copy()
     y = np.asarray(y, float).copy()
     w = np.asarray(w, float)
     h = np.asarray(h, float)
     is_pre = np.asarray(is_pre, bool)
     if len(x) <= 1:
+        if nonneg and len(x) == 1 and not is_pre[0]:
+            x[0] = max(x[0], 0.0); y[0] = max(y[0], 0.0)
         return x, y
-    return _cleanup(x, y, w, h, is_pre, max_iter)
+    return _cleanup(x, y, w, h, is_pre, max_iter, floor=0.0 if nonneg else None)
 
 
 def verify_overlap(x, y, w, h):

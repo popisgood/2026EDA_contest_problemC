@@ -36,7 +36,8 @@ def run_start(seed, P):
     for _ in range(P["rounds"]):
         x, y = grouping_repair(x, y, w, h, clust_id, is_pre)
         x, y = boundary_snap(x, y, w, h, bcode, is_pre)
-    x, y = remove_overlap(x, y, w, h, is_pre)   # final hard-feasibility net
+    # final hard-feasibility net; nonneg also enforces the x=0/y=0 canvas walls
+    x, y = remove_overlap(x, y, w, h, is_pre, nonneg=P.get("nonneg", False))
     return x, y, w, h
 
 

@@ -83,6 +83,22 @@ def place(
     # (subset 2.604 -> 2.537).  0 = off.
     lam_out = float(os.environ.get("ELECTRO_LAM_OUT", "2.0"))
     target_util = float(os.environ.get("ELECTRO_TARGET_UTIL", "0.85"))
+    # Hard canvas walls at x=0, y=0 (projected gradient): after each step clamp
+    # every movable block's lower-left corner to >= 0, so the layout stays in the
+    # first quadrant (the contest's origin convention) and blocks can sit flush on
+    # the X / Y axes -- a hard wall packs tighter than a soft repulsion.
+    clamp_canvas = os.environ.get("ELECTRO_CLAMP", "0") == "1"
+    # Quadratic boundary penalty (canvas origin walls at x=0, y=0): a smooth,
+    # differentiable confinement that pushes blocks back into the first quadrant
+    # during optimization (the standard analytical fixed-outline technique --
+    # gentler than a hard clamp).  Weight ramps up over the run.  0 = off.
+    lam_wall = float(os.environ.get("ELECTRO_WALL", "0"))
+    lam_wall_lin = float(os.environ.get("ELECTRO_WALL_LIN", "0"))  # L1 exact-penalty wall
+    # External (pin/terminal) wirelength weight.  Boosting it drags pin-connected
+    # blocks onto their fixed terminals -> lower HPWLext AND anchors the layout to
+    # the (positive-coordinate) terminal frame.  Subset 2.537 (w=1) -> 2.300 (w=11);
+    # smooth basin ~8-18, overshoot >=25.  10 = robust default.
+    ext_wl = float(os.environ.get("ELECTRO_EXT_WL", "10.0"))
 
     a = area_targets[:N].float().to(dev).clamp(min=1e-9)
     cons = constraints[:N].to(dev)
@@ -224,7 +240,9 @@ def place(
         if eb is not None:
             wl = wl + (wb * (_sabs(ecx[ia] - ecx[ib], g_wl) + _sabs(ecy[ia] - ecy[ib], g_wl))).sum()
         if ep is not None:
-            wl = wl + (wp * (_sabs(tx - ecx[ebk], g_wl) + _sabs(ty - ecy[ebk], g_wl))).sum()
+            # ext_wl scales the pin/terminal (external) wirelength pull, to test
+            # dragging pin-connected blocks closer to their fixed terminals.
+            wl = wl + ext_wl * (wp * (_sabs(tx - ecx[ebk], g_wl) + _sabs(ty - ecy[ebk], g_wl))).sum()
         wl = wl / total_w
 
         dx = (ecx[ti] - ecx[tj]).abs()
@@ -249,6 +267,21 @@ def place(
             ey = (torch.relu((ecy + 0.5 * h) - (gy + hL))
                   + torch.relu((gy - hL) - (ecy - 0.5 * h)))
             out = (ex + ey).sum() / N
+
+        # Walls at x=0 and y=0 confining blocks to the first quadrant.
+        #  * quadratic (lam_wall): smooth, but the restoring force -> 0 at the
+        #    boundary, so it leaves an equilibrium gap (never exactly non-negative).
+        #  * linear / L1 (lam_wall_lin): a CONSTANT force the instant a corner goes
+        #    negative, vanishing at >=0 -- an *exact* penalty (a finite weight that
+        #    exceeds the opposing forces pins blocks exactly on the axis, no gap).
+        wall = ecx.new_zeros(())
+        if lam_wall > 0.0:
+            wall = (torch.relu(0.5 * w - ecx) ** 2
+                    + torch.relu(0.5 * h - ecy) ** 2).sum() / N
+        wall_lin = ecx.new_zeros(())
+        if lam_wall_lin > 0.0:
+            wall_lin = (torch.relu(0.5 * w - ecx)
+                        + torch.relu(0.5 * h - ecy)).sum() / N
 
         grp = ecx.new_zeros(())
         if Gc > 0:
@@ -280,8 +313,17 @@ def place(
         lam_bnd = 0.2 + 1.6 * frac
 
         loss = wl + lam_ov * ov + lam_bb * bbox + lam_grp * grp + lam_bnd * bnd + lam_out * out
+        if lam_wall > 0.0:        # ramp the wall up so it firmly confines by the end
+            loss = loss + (lam_wall * frac) * wall
+        if lam_wall_lin > 0.0:    # constant (not ramped): strong from iter 0 so
+            loss = loss + lam_wall_lin * wall_lin   # blocks never escape negative
         loss.backward()
         opt.step()
+
+        if clamp_canvas:   # project movable blocks back into the first quadrant
+            with torch.no_grad():
+                cx.data.copy_(torch.maximum(cx.data, 0.5 * w.detach()))
+                cy.data.copy_(torch.maximum(cy.data, 0.5 * h.detach()))
 
     with torch.no_grad():
         w, h = shapes(la)
