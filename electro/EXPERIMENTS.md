@@ -33,6 +33,7 @@ Baseline at sprint start (min-displacement repairs + 3 iterate rounds):
 | T8| ML warm-start init (FloorplanTfmr)| ML_INIT=1 (+ jitter)       | s1 2.78 / s3 2.16 / s5 2.11 / s8 2.07 | ACCEPT (multi-start only) |
 | T9| canvas clamp / first-quadrant wall| CLAMP=1                    | 2.81 | REJECT (over-constrains; -score) |
 | T10| external (pin) WL weight (#7)     | EXT_WL 3/8/11/14/25        | 2.41/2.34/2.300/2.32/2.71 | ACCEPT (=10) |
+| T11| eDensity FFT canvas (#1,#2,#5)     | EDENSITY 2/10, UTIL .70-.98 | 5.06-6.59 | REJECT (legalizer un-does it -- see below) |
 
 EXT_WL detail: boosting the pin/terminal wirelength pull drags pin-connected blocks
 onto their fixed terminals -> lower HPWLext, and anchors the layout to the positive
@@ -61,6 +62,68 @@ mis-positioning relative to the canvas.  The proper fix = eDensity FFT density f
 on [0,W]x[0,H] with Neumann BC (DREAMPlace fence-region style) -- confines the whole
 layout naturally; also the path to lower area_gap / the friend's ~1.07.  TODO, big.
 All of WALL / WALL_LIN / NONNEG / CLAMP are OFF by default (negative coords kept).
+
+## eDensity FFT (T11) -- IMPLEMENTED, works as global placement, but BLOCKED by the legalizer
+Built the eDensity electrostatic density field (analytical_place.py: ELECTRO_EDENSITY,
+_GRID, _UTIL).  Fixed canvas [0,Wc]x[0,Hc] anchored at the ORIGIN; aspect taken from the
+pin-terminal bbox (a strong proxy -- pin bbox aspect tracks the GT die aspect within ~10%,
+and both anchor at (0,0)); area = total_block_area / ed_util.  Density = differentiable
+block/bin overlap area; Neumann-BC Poisson energy via an orthonormal DCT-II basis (Cb @ rho
+@ Cb^T, weighted by 1/(lam_x+lam_y)).  CRITICAL: eDensity alone is a *dispersal* force (it
+flattens density and, unconstrained, evacuates the canvas to thin blocks out -> util DROPS).
+The fixed region only becomes a "fill at ed_util" target with a HARD per-iteration canvas
+projection (clamp every movable center so its rect stays in [0,Wc]x[0,Hc]); that clamp is
+what conserves charge and confines.
+
+place() output is exactly as intended: minxy ~ 0 (NEGATIVE COORDS FIXED), bbox-util driven
+to ed_util (0.85-0.98), overlap ~1-2% at util 0.85.  BUT the real evaluator score got much
+WORSE: subset 2.16 -> 5.06 (util .98) ... 5.5-6.6 across util .70-.94.  Root cause = the
+LEGALIZER, not eDensity:
+  * legalize() compaction (longest-path) does NOT respect a fixed outline -- removing
+    overlap pushes blocks PAST Wc/Hc, and eviction stacks leftovers above the layout.  Final
+    util collapses (e.g. tid99 util .90 -> .49), so area_gap ends up WORSE than the free
+    baseline, and HPWL_gap (+1.7-3.4) and V_rel (.25-.46) explode.
+  * a bounded push-apart cleanup (keep blocks inside the box) was prototyped
+    (electro/test_boundedleg.py): it PRESERVES util but does NOT converge -- deadlocks with
+    ~1-7% residual overlap even on low-overlap (ov1=30) input -> infeasible.  Fixed-outline
+    zero-overlap packing of arbitrary-size blocks is bin-packing; greedy push-apart can't.
+Conclusion: eDensity is correct and necessary (it's the global-placement half of the
+ePlace/DREAMPlace flow) but NOT sufficient.  Reaching GT util (~0.965, area_gap->0, the
+friend's ~1.07) needs a TIGHT fixed-outline legalizer -- Abacus-style row legalization, or
+repacking the analytical global positions through the C++ B*-tree packer (zero-overlap by
+construction).  That legalizer is the next real piece of work, bigger than eDensity itself.
+eDensity is left in, OFF by default (ELECTRO_EDENSITY=0) -> default path bit-identical to
+8e6541a; turn it on once a fixed-outline legalizer exists.
+Repro/dev tools added: electro/score_subset.sh, sweep.sh, probe_canvas.py, probe_ov.py,
+smoke_edensity.py, test_boundedleg.py.
+
+## First-quadrant containment (negative-coord fix) -- it is the SAME problem as area_gap
+Goal: blocks in the first quadrant (x,y >= 0), no upper bound, util not chased.  Findings
+(subset, current best config; baseline w/ neg coords = 2.16):
+  * NONNEG floored ONLY at the final remove_overlap: 7.48 (explodes -- shoving the spread,
+    drifted bulk back to the floor cascades the legalizer).
+  * Made the WHOLE chain floor-aware (legalize + grouping_repair + boundary_snap +
+    remove_overlap all keep movable corners >= 0, incrementally): NONNEG 7.48 -> 5.68,
+    CLAMP+NONNEG 5.13 -> 3.01 (and V_rel back to ~baseline 0.21).  TRUE first-quadrant
+    (every case lands at min (0,0)) needs CLAMP=1 (keeps place() positive) + NONNEG=1
+    (keeps the chain positive); CLAMP alone does NOT -- legalize/repair re-drift it negative
+    (tid0 ends y=-40).  Best guaranteed-first-quadrant config = CLAMP+NONNEG = 3.01.
+  * KEY INSIGHT: negative coords are a SYMPTOM OF LOW UTIL.  GT packs at ~0.965 and fits in
+    [0,die]; our ~0.55-util layout is ~1.8x too big to fit the positive die frame, so the
+    excess spills into negative coords.  Forcing it positive doesn't remove the excess -- it
+    just redirects the spill into a larger positive bbox (area_gap +0.82 -> +1.13).  So
+    first-quadrant and area_gap CANNOT be decoupled; the +0.85 cost of guaranteed
+    first-quadrant *is* the area_gap inflation.  Both have the same real fix: a tight
+    fixed-outline packer (see eDensity T11 conclusion).  The floor-aware chain is kept
+    (opt-in via NONNEG; default path unchanged, still 2.16 with neg coords).
+
+## v10 evaluator (was v9 in this doc's header) -- two scoring facts that changed
+The live evaluator is iccad2026contest/iccad2026_evaluate.py (PDF v10, 2026-06-03):
+1. gaps are CLAMPED at 0 from below: quality = 1 + 0.5*(max(0,hpwl_gap)+max(0,area_gap)).
+   Beating baseline gives NO bonus (v9 used signed gaps).  So target area_gap ~ 0, don't
+   over-compress past GT util.
+2. Total Score weight is e^{n/12} (not e^n): n=120 ~ 34%, but cases < n=111 still ~28%
+   combined -- small cases are NOT negligible anymore.
 
 ML-init detail: pure prediction as init (seed 0, no jitter) is WORSE than random
 (2.78 vs 2.54 at s1) -- the raw prediction sits in a mediocre basin.  But ML+jitter
@@ -111,3 +174,5 @@ and quality wins (raise seeds).  Default seeds=1 (ML auto-off; ML only helps mul
 ELECTRO_SEEDS=1  ELECTRO_PARALLEL=0  ELECTRO_ML_INIT=1  ELECTRO_REPAIR_ROUNDS=3
 ELECTRO_AREA_GROW=0.1 ELECTRO_GROW_END=0.7  ELECTRO_LAM_OUT=2.0 ELECTRO_TARGET_UTIL=0.85
 ELECTRO_EXT_WL=10  ELECTRO_CLAMP=0  ELECTRO_ITERS=600 ELECTRO_LR=0.02 ELECTRO_ML_JITTER=0.15
+ELECTRO_EDENSITY=0 (off) ELECTRO_EDENSITY_GRID=64 ELECTRO_EDENSITY_UTIL=0.98  # needs a
+  fixed-outline legalizer before it helps -- see "eDensity FFT (T11)" above
