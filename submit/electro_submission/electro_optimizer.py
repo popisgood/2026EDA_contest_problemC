@@ -205,12 +205,13 @@ class MyOptimizer(FloorplanOptimizer):
         if self._predictor is None:
             try:
                 # Find the `ml/` package: explicit env override, then bundled next
-                # to this file (submission layout), then the dev tree.  Keeps both
-                # the local checkout and a self-contained package working.
+                # to this file (submission layout), then the PARENT directory (the
+                # dev-tree layout, where ml/ sits beside electro/).  All paths are
+                # relative to __file__ -- no machine-specific absolute paths.
                 here = os.path.dirname(os.path.abspath(__file__))
                 ml_dir = None
                 for d in (os.environ.get("ELECTRO_ML_DIR"), here,
-                          "/home/pop/2026_EDA_contest"):
+                          os.path.dirname(here)):
                     if d and os.path.isdir(os.path.join(d, "ml")):
                         ml_dir = d
                         break
