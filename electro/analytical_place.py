@@ -192,9 +192,16 @@ def place(
         cy = torch.rand(N, generator=gen, device=dev)
     cx = torch.where(is_pre, pre_cx, cx).clone().requires_grad_(True)
     cy = torch.where(is_pre, pre_cy, cy).clone().requires_grad_(True)
-    la = torch.zeros(K, device=dev, requires_grad=True)   # one log-aspect per shape-group
+    # Family-Two shaping probe: ELECTRO_FREEZE_SHAPE=1 keeps every soft block square
+    # (la frozen at 0, excluded from the optimizer) -> ablates the differentiable
+    # aspect-ratio co-optimization, to measure how much shaping already contributes.
+    freeze_shape = os.environ.get("ELECTRO_FREEZE_SHAPE", "0") == "1"
+    la = torch.zeros(K, device=dev, requires_grad=not freeze_shape)  # log-aspect per shape-group
 
-    AR_CAP = 4.0
+    # Aspect-ratio cap (w/h in [1/AR_CAP, AR_CAP]).  The evaluator only checks soft
+    # AREA (+/-1%), not aspect, so a looser cap is legal and may let shaping fill
+    # more dead space.  ELECTRO_AR_CAP to sweep.
+    AR_CAP = float(os.environ.get("ELECTRO_AR_CAP", "4.0"))
     la_cap = float(torch.log(torch.tensor(AR_CAP)))
 
     eb = _valid(b2b_connectivity)
@@ -276,12 +283,13 @@ def place(
         return w, h
 
     opt_name = os.environ.get("ELECTRO_OPT", "adam").lower()
+    params = [cx, cy] if freeze_shape else [cx, cy, la]
     if opt_name == "nesterov":
         # ePlace-style accelerated gradient (SGD + Nesterov momentum).  Needs a
         # larger lr than Adam since it has no per-parameter scaling.
-        opt = torch.optim.SGD([cx, cy, la], lr=lr, momentum=0.9, nesterov=True)
+        opt = torch.optim.SGD(params, lr=lr, momentum=0.9, nesterov=True)
     else:
-        opt = torch.optim.Adam([cx, cy, la], lr=lr)
+        opt = torch.optim.Adam(params, lr=lr)
 
     for it in range(iters):
         opt.zero_grad()

@@ -11,6 +11,8 @@ created, so the fork inherits them and we never pickle the connectivity tensors.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from analytical_place import place
@@ -44,6 +46,23 @@ def run_start(seed, P):
     # final hard-feasibility net; nonneg also enforces the x=0/y=0 canvas walls
     x, y = remove_overlap(x, y, w, h, is_pre, nonneg=P.get("nonneg", False))
     return x, y, w, h
+
+
+def compact_variant(start, P):
+    """SDS-style compaction + soft shaping of one legalized layout, returned as an
+    ADDITIONAL candidate.  solve() ranks it against the un-compacted layout by the
+    full cost proxy (incl. exp(2*V_rel)), so it is only ever chosen when it is NET
+    better -- compaction cuts area_gap but can disturb grouping/boundary, and the
+    ranking, not a bbox-only check, decides the trade.  Overlap-free by construction."""
+    from shape_compact import compact_and_shape
+    x, y, w, h = start
+    nonneg = P.get("nonneg", False)
+    floor = 0.0 if nonneg else float(min(x.min(), y.min()))
+    ar = float(os.environ.get("ELECTRO_COMPACT_AR", "4.0"))
+    cx, cy, cw, ch = compact_and_shape(
+        x, y, w, h, P["is_soft"], P["is_pre"], P["mib_id"], ar_cap=ar, floor=floor)
+    cx, cy = remove_overlap(cx, cy, cw, ch, P["is_pre"], nonneg=nonneg)
+    return cx, cy, cw, ch
 
 
 def pool_init(threads=1):

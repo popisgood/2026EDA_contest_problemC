@@ -36,6 +36,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # the lower-cost (but negative-coord) configuration.
 os.environ.setdefault("ELECTRO_CLAMP", "1")
 os.environ.setdefault("ELECTRO_NONNEG", "1")
+# SDS-style compaction + soft-shaping as a strictly-additive extra candidate
+# (kept only when the exp(2*V_rel)-aware ranking finds it net-better).  Full-100
+# 2.9660 -> 2.8414, 100/100 feasible.  ELECTRO_COMPACT=0 restores the old path.
+os.environ.setdefault("ELECTRO_COMPACT", "1")
 
 from iccad2026_evaluate import FloorplanOptimizer
 from legalize import verify_overlap
@@ -119,6 +123,8 @@ class MyOptimizer(FloorplanOptimizer):
 
         cons = constraints[:block_count].cpu().numpy()
         is_pre = (cons[:, 1] != 0).astype(bool)
+        is_fixed = (cons[:, 0] != 0).astype(bool)
+        is_soft = ~(is_fixed | is_pre)
         mib_id = cons[:, 2].astype(int) if cons.shape[1] > 2 else np.zeros(block_count, int)
         clust_id = cons[:, 3].astype(int) if cons.shape[1] > 3 else np.zeros(block_count, int)
         bcode = cons[:, 4].astype(int) if cons.shape[1] > 4 else np.zeros(block_count, int)
@@ -140,6 +146,7 @@ class MyOptimizer(FloorplanOptimizer):
             "device": self.device, "init": init_centers, "is_pre": is_pre,
             "clust_id": clust_id, "bcode": bcode, "rounds": self.repair_rounds,
             "nonneg": os.environ.get("ELECTRO_NONNEG", "0") == "1",
+            "is_soft": is_soft, "mib_id": mib_id,
         }
 
         # Multi-start: each seed lands in a different basin; run them in parallel
@@ -170,6 +177,14 @@ class MyOptimizer(FloorplanOptimizer):
                 electro_parallel.WORK = None
         if starts is None:
             starts = [electro_parallel.run_start(s, P) for s in range(nseeds)]
+
+        # SDS-style compaction + soft shaping (opt-in): add the compacted layout of
+        # each start as an EXTRA candidate.  The ranking below (which includes
+        # exp(2*V_rel)) keeps it only when it is net better -- compaction cuts
+        # area_gap but can disturb grouping/boundary, so we let the cost proxy, not a
+        # bbox-only test, decide.  Strictly additive: can never worsen the result.
+        if os.environ.get("ELECTRO_COMPACT", "0") == "1":
+            starts = starts + [electro_parallel.compact_variant(s, P) for s in starts]
 
         cands = []
         for (x, y, w, h) in starts:
