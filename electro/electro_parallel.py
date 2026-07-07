@@ -48,19 +48,33 @@ def run_start(seed, P):
     return x, y, w, h
 
 
-def compact_variant(start, P):
+def compact_variant(start, P, aware=False):
     """SDS-style compaction + soft shaping of one legalized layout, returned as an
     ADDITIONAL candidate.  solve() ranks it against the un-compacted layout by the
     full cost proxy (incl. exp(2*V_rel)), so it is only ever chosen when it is NET
-    better -- compaction cuts area_gap but can disturb grouping/boundary, and the
-    ranking, not a bbox-only check, decides the trade.  Overlap-free by construction."""
+    better.  Overlap-free by construction.
+
+    Two flavours, BOTH added as candidates (the ranking picks per case):
+      * aware=False (plain): maximum compaction force, constraint-blind -- wins
+        where grouping/boundary tolerate the squeeze (e.g. tid20/80).
+      * aware=True (S1): clusters compact as RIGID bodies (grouping preserved,
+        members excluded from reshaping), then the repair chain re-snaps boundary
+        blocks onto the new tighter bbox -- rescues the cases where the plain
+        squeeze blew up V_rel and got rejected (e.g. tid60/99)."""
     from shape_compact import compact_and_shape
     x, y, w, h = start
     nonneg = P.get("nonneg", False)
     floor = 0.0 if nonneg else float(min(x.min(), y.min()))
     ar = float(os.environ.get("ELECTRO_COMPACT_AR", "4.0"))
     cx, cy, cw, ch = compact_and_shape(
-        x, y, w, h, P["is_soft"], P["is_pre"], P["mib_id"], ar_cap=ar, floor=floor)
+        x, y, w, h, P["is_soft"], P["is_pre"], P["mib_id"], ar_cap=ar, floor=floor,
+        clust_id=P["clust_id"] if aware else None)
+    if aware:
+        for _ in range(2):
+            cx, cy = grouping_repair(cx, cy, cw, ch, P["clust_id"], P["is_pre"],
+                                     floor=floor)
+            cx, cy = boundary_snap(cx, cy, cw, ch, P["bcode"], P["is_pre"],
+                                   floor=floor)
     cx, cy = remove_overlap(cx, cy, cw, ch, P["is_pre"], nonneg=nonneg)
     return cx, cy, cw, ch
 

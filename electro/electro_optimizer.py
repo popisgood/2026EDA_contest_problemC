@@ -184,7 +184,25 @@ class MyOptimizer(FloorplanOptimizer):
         # area_gap but can disturb grouping/boundary, so we let the cost proxy, not a
         # bbox-only test, decide.  Strictly additive: can never worsen the result.
         if os.environ.get("ELECTRO_COMPACT", "0") == "1":
-            starts = starts + [electro_parallel.compact_variant(s, P) for s in starts]
+            # plain (max squeeze) + S1 constraint-aware (rigid clusters + boundary
+            # re-snap) -- the ranking picks the best of {none, plain, S1} per case.
+            starts = starts + [electro_parallel.compact_variant(s, P, aware=False)
+                               for s in starts] \
+                            + [electro_parallel.compact_variant(s, P, aware=True)
+                               for s in starts]
+
+        # M1 constructive-imitation candidate (opt-in, ELECTRO_M1=1): one
+        # autoregressive rollout with exact legality masking -> zero-overlap
+        # layout, added as ANOTHER candidate for the same cost-aware ranking.
+        # Strictly additive; needs trained weights (ml/weights/m1_*.pt).
+        if os.environ.get("ELECTRO_M1", "0") == "1":
+            m1 = self._m1_candidate(block_count, area_targets, constraints,
+                                    target_positions, b2b_connectivity,
+                                    p2b_connectivity, pins_pos)
+            if m1 is not None:
+                starts = starts + [m1]
+                if os.environ.get("ELECTRO_COMPACT", "0") == "1":
+                    starts = starts + [electro_parallel.compact_variant(m1, P)]
 
         cands = []
         for (x, y, w, h) in starts:
@@ -212,6 +230,47 @@ class MyOptimizer(FloorplanOptimizer):
         )
         return [(float(x[i]), float(y[i]), float(w[i]), float(h[i]))
                 for i in range(block_count)]
+
+    def _m1_candidate(self, block_count, area_targets, constraints,
+                      target_positions, b2b, p2b, pins):
+        """One M1 rollout as (x, y, w, h) numpy arrays, or None on any failure
+        (missing weights / dead-end): the strictly-additive fallback contract."""
+        if getattr(self, "_m1", None) is None:
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                ml_dir = None
+                for d in (os.environ.get("ELECTRO_ML_DIR"), here,
+                          os.path.dirname(here)):
+                    if d and os.path.isdir(os.path.join(d, "ml")):
+                        ml_dir = d
+                        break
+                if ml_dir is None:
+                    raise FileNotFoundError("ml/ package not found")
+                if ml_dir not in sys.path:
+                    sys.path.insert(0, ml_dir)
+                from ml.m1_infer import M1Predictor
+                wts = os.environ.get(
+                    "ELECTRO_M1_WEIGHTS",
+                    os.path.join(ml_dir, "ml", "weights", "m1_v1.pt"))
+                self._m1 = M1Predictor(wts, device="cpu")
+            except Exception as e:
+                sys.stderr.write(f"[electro] M1 unavailable: {e}\n")
+                self._m1 = False
+        if not self._m1 or not self._m1.available():
+            return None
+        try:
+            pos = self._m1.predict(block_count, area_targets, constraints,
+                                   target_positions, b2b, p2b, pins)
+            if pos is None:
+                return None
+            x = np.array([p[0] for p in pos])
+            y = np.array([p[1] for p in pos])
+            w = np.array([p[2] for p in pos])
+            h = np.array([p[3] for p in pos])
+            return x, y, w, h
+        except Exception as e:
+            sys.stderr.write(f"[electro] M1 predict failed: {e}\n")
+            return None
 
     def _ml_centers(self, block_count, area_targets, constraints, target_positions,
                     b2b, p2b, pins):

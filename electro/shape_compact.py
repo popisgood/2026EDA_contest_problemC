@@ -40,37 +40,48 @@ def _overlap(x, y, w, h):
     return t
 
 
-def _compact_axis(pos, size, opos, osize, locked, floor):
-    """Longest-path pack toward `floor` along one axis.  Pairs overlapping in the
-    orthogonal axis are separation-constrained; order taken from current pos.  Packing
-    only decreases coords (proven) so it never introduces overlap."""
+def _compact_axis(pos, size, opos, osize, unit, locked_u, floor):
+    """Longest-path pack toward `floor` along one axis, with RIGID UNITS (S1):
+    blocks sharing a unit id (cluster members) translate together, so grouping
+    abutment survives compaction; units containing a preplaced block are pinned.
+    Pairs overlapping in the orthogonal axis are separation-constrained.  Packing
+    only decreases coords (constraint <= original gap; unprocessed neighbours use
+    their original position, an upper bound of their final one) -> overlap-free."""
     n = len(pos)
-    order = sorted(range(n), key=lambda i: (pos[i], i))
-    new = pos.copy()
     E = 1e-7
-    for j in order:
-        if locked[j]:
-            continue  # preplaced: pinned anchor
+    members = {}
+    for i in range(n):
+        members.setdefault(int(unit[i]), []).append(i)
+    base = {u: min(pos[i] for i in m) for u, m in members.items()}
+    off = pos - np.array([base[int(unit[i])] for i in range(n)])
+    newbase = {}
+    for u in sorted(members, key=lambda k: base[k]):
+        if locked_u[u]:
+            newbase[u] = base[u]
+            continue
         lb = floor
-        o0, o1 = opos[j], opos[j] + osize[j]
-        for i in range(n):
-            if i == j:
-                continue
-            if opos[i] < o1 - E and o0 < opos[i] + osize[i] - E:        # orthogonal overlap
-                if pos[i] < pos[j] - E or (abs(pos[i] - pos[j]) <= E and i < j):
-                    c = new[i] + size[i]
-                    if c > lb:
-                        lb = c
-        new[j] = lb
-    return new
+        for i in members[u]:
+            o0, o1 = opos[i], opos[i] + osize[i]
+            for j in range(n):
+                if int(unit[j]) == u:
+                    continue  # rigid: no intra-unit constraints
+                if opos[j] < o1 - E and o0 < opos[j] + osize[j] - E:
+                    if pos[j] < pos[i] - E or (abs(pos[j] - pos[i]) <= E and j < i):
+                        v = int(unit[j])
+                        jpos = (newbase[v] + off[j]) if v in newbase else pos[j]
+                        c = jpos + size[j] - off[i]
+                        if c > lb:
+                            lb = c
+        newbase[u] = min(lb, base[u])  # packing never increases coords
+    return np.array([newbase[int(unit[i])] + off[i] for i in range(n)])
 
 
-def _compact(x, y, w, h, locked, floor, rounds=2):
+def _compact(x, y, w, h, unit, locked_u, floor, rounds=2):
     x = x.copy()
     y = y.copy()
     for _ in range(rounds):
-        x = _compact_axis(x, w, y, h, locked, floor)
-        y = _compact_axis(y, h, x, w, locked, floor)
+        x = _compact_axis(x, w, y, h, unit, locked_u, floor)
+        y = _compact_axis(y, h, x, w, unit, locked_u, floor)
     return x, y
 
 
@@ -123,15 +134,32 @@ def _fill_up(x, y, w, h, reshapable, ar_cap):
 
 
 def compact_and_shape(x, y, w, h, is_soft, is_pre, mib_id,
-                      ar_cap=4.0, floor=0.0, rounds=4):
+                      ar_cap=4.0, floor=0.0, rounds=4, clust_id=None):
     """Return a compacted+shaped (x, y, w, h) -- or the input unchanged if the pass
-    fails to strictly shrink the bbox at near-zero overlap."""
+    fails to strictly shrink the bbox at near-zero overlap.
+
+    S1 (constraint-aware): pass `clust_id` to compact each grouping cluster as a
+    rigid body (members keep their relative offsets -> V_grouping preserved);
+    a unit containing a preplaced block is pinned entirely."""
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     w = np.asarray(w, float)
     h = np.asarray(h, float)
-    locked = np.asarray(is_pre, bool)
-    reshapable = np.asarray(is_soft, bool) & (np.asarray(mib_id, int) == 0)
+    n = len(x)
+    pre = np.asarray(is_pre, bool)
+    # rigid units: cluster id > 0 -> one unit per cluster; else singleton
+    clust = (np.asarray(clust_id, int) if clust_id is not None
+             else np.zeros(n, int))
+    # never reshape MIB members (same-shape) NOR cluster members (reshaping
+    # shrinks the orthogonal side and can detach them from the group)
+    reshapable = (np.asarray(is_soft, bool) & (np.asarray(mib_id, int) == 0)
+                  & (clust == 0))
+    raw = np.where(clust > 0, clust, -(np.arange(n) + 2))
+    _, unit = np.unique(raw, return_inverse=True)
+    locked_u = np.zeros(int(unit.max()) + 1, dtype=bool)
+    for i in range(n):
+        if pre[i]:
+            locked_u[unit[i]] = True
 
     a0 = _bbox_area(x, y, w, h)
     best = (x.copy(), y.copy(), w.copy(), h.copy())
@@ -139,11 +167,11 @@ def compact_and_shape(x, y, w, h, is_soft, is_pre, mib_id,
 
     cx, cy, cw, ch = x.copy(), y.copy(), w.copy(), h.copy()
     for _ in range(rounds):
-        cx, cy = _compact(cx, cy, cw, ch, locked, floor)
+        cx, cy = _compact(cx, cy, cw, ch, unit, locked_u, floor)
         cw, ch = _fill_right(cx, cy, cw, ch, reshapable, ar_cap)
-        cx, cy = _compact(cx, cy, cw, ch, locked, floor)
+        cx, cy = _compact(cx, cy, cw, ch, unit, locked_u, floor)
         cw, ch = _fill_up(cx, cy, cw, ch, reshapable, ar_cap)
-        cx, cy = _compact(cx, cy, cw, ch, locked, floor)
+        cx, cy = _compact(cx, cy, cw, ch, unit, locked_u, floor)
         a = _bbox_area(cx, cy, cw, ch)
         if a < best_area - 1e-9 and _overlap(cx, cy, cw, ch) < 1e-6:
             best_area = a

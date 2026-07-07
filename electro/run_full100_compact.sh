@@ -7,7 +7,7 @@ OPT=/home/pop/2026_EDA_contest/electro/electro_optimizer.py
 cd "$EVAL"
 
 echo "[$(date +%T)] OFF full-100 ..."
-"$PY" iccad2026_evaluate.py --evaluate "$OPT" >/dev/null 2>&1
+ELECTRO_COMPACT=0 "$PY" iccad2026_evaluate.py --evaluate "$OPT" >/dev/null 2>&1
 cp electro_optimizer_results.json /tmp/off_results.json
 
 echo "[$(date +%T)] ON  full-100 (ELECTRO_COMPACT=1) ..."

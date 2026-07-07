@@ -30,5 +30,7 @@ PYEOF
   echo
 }
 
-run_cfg "compaction OFF (baseline)"
+# NOTE: ELECTRO_COMPACT now defaults ON in electro_optimizer.py, so the baseline
+# must force it off explicitly.
+run_cfg "compaction OFF (ELECTRO_COMPACT=0)" ELECTRO_COMPACT=0
 run_cfg "compaction ON  (ELECTRO_COMPACT=1)" ELECTRO_COMPACT=1
