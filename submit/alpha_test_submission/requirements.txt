@@ -1,9 +1,21 @@
-# ICCAD 2026 FloorSet Challenge - Requirements
-# Install: pip install -r requirements.txt
+# ICCAD 2026 FloorSet Challenge (Problem C) - runtime requirements
+#
+# The evaluation machine already ships PyTorch 2.12.0 (+ numpy), so on the
+# official environment NOTHING needs to be installed.  These are listed only
+# in case the optimizer is run on a fresh environment.
+#
+# At solve() time the optimizer imports ONLY torch (numpy comes in transitively
+# with torch).  The C++ solver binary is statically linked and needs no Python.
 
-torch>=2.0.0
-numpy>=1.24.0
-shapely>=2.0.0
-matplotlib>=3.7.0
-tqdm>=4.60.0
-requests>=2.28.0
+torch
+numpy
+
+# ---------------------------------------------------------------------------
+# The packages below are NOT needed to run the optimizer.  They are used only
+# for (re)training the ML model, downloading the dataset, or plotting layouts,
+# and can be ignored on the evaluation machine:
+#   shapely      # geometry checks in offline validation tooling
+#   matplotlib   # layout visualisation
+#   tqdm         # training progress bars
+#   requests     # dataset download helper
+# ---------------------------------------------------------------------------

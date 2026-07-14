@@ -63,6 +63,7 @@ def place(
     seed: int = 0,
     device: str = "cpu",
     init_centers=None,
+    init_la=None,
 ):
     N = int(block_count)
     if N == 0:
@@ -203,6 +204,17 @@ def place(
     # more dead space.  ELECTRO_AR_CAP to sweep.
     AR_CAP = float(os.environ.get("ELECTRO_AR_CAP", "4.0"))
     la_cap = float(torch.log(torch.tensor(AR_CAP)))
+
+    if init_la is not None and not freeze_shape:
+        # M1 warm-start also seeds the per-block log-aspect: M1's aspect bins carry
+        # real signal (unlike the old regressor, whose la we left at 0).  place()
+        # optimizes ONE la per MIB shape-group, so average the per-block seed over
+        # each group; clamp to the aspect cap.  (la = log(w/h) is scale-free, so no
+        # /S normalization is needed -- simpler & lower-risk than init_centers.)
+        ila = init_la.to(dev).float()
+        ila_sg = (torch.zeros(K, device=dev).index_add_(0, inv, ila)
+                  / cnt_sg.clamp(min=1.0)).clamp(-la_cap, la_cap)
+        la = ila_sg.detach().clone().requires_grad_(True)
 
     eb = _valid(b2b_connectivity)
     ep = _valid(p2b_connectivity)

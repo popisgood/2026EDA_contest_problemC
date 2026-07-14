@@ -202,7 +202,26 @@ class MyOptimizer(FloorplanOptimizer):
             if m1 is not None:
                 starts = starts + [m1]
                 if os.environ.get("ELECTRO_COMPACT", "0") == "1":
-                    starts = starts + [electro_parallel.compact_variant(m1, P)]
+                    # M1 has no structural boundary/grouping guarantee (diag_m1.py
+                    # showed Vrel 0.5-0.8 raw), so it needs the S1-aware repair
+                    # chain even more than the analytical starts do -- give it both
+                    # variants, same as above, and let the ranking pick.
+                    starts = starts + [
+                        electro_parallel.compact_variant(m1, P, aware=False),
+                        electro_parallel.compact_variant(m1, P, aware=True),
+                    ]
+                # M1 warm-start (independent switch so it can be A/B'd alone):
+                # seed electro's gradient optimizer from M1's legal rollout, let
+                # continuous refinement fix HPWL/V that M1's autoregressive drift
+                # leaves behind.  Its own compacted variants join the ranking too.
+                if os.environ.get("ELECTRO_M1_WARMSTART", "0") == "1":
+                    ws = electro_parallel.m1_warmstart_variant(m1, P)
+                    starts = starts + [ws]
+                    if os.environ.get("ELECTRO_COMPACT", "0") == "1":
+                        starts = starts + [
+                            electro_parallel.compact_variant(ws, P, aware=False),
+                            electro_parallel.compact_variant(ws, P, aware=True),
+                        ]
 
         cands = []
         for (x, y, w, h) in starts:

@@ -48,6 +48,37 @@ def run_start(seed, P):
     return x, y, w, h
 
 
+def m1_warmstart_variant(m1_pos, P):
+    """Warm-start electro's analytical optimizer from M1's LEGAL rollout: M1 supplies
+    the starting positions AND aspect ratios, then place() runs its gradient descent
+    from there to clean up HPWL / grouping / boundary.  The continuous refinement is
+    immune to M1's autoregressive exposure bias (it's smooth optimization, not
+    step-by-step guessing), so it can fix the drift M1 alone can't.  Returned as an
+    extra candidate; same legalize+repair tail as run_start."""
+    import torch
+    x0, y0, w0, h0 = (np.asarray(a, float) for a in m1_pos)
+    init_centers = torch.tensor(np.stack([x0 + 0.5 * w0, y0 + 0.5 * h0], axis=1),
+                                dtype=torch.float32)
+    init_la = torch.tensor(np.log(np.clip(w0, 1e-6, None) / np.clip(h0, 1e-6, None)),
+                           dtype=torch.float32)
+    positions, _ = place(
+        P["n"], P["area"], P["b2b"], P["p2b"], P["pins"], P["cons"], P["tp"],
+        iters=P["iters"], lr=P["lr"], device=P["device"], seed=0,
+        init_centers=init_centers, init_la=init_la)
+    x = np.array([p[0] for p in positions], dtype=float)
+    y = np.array([p[1] for p in positions], dtype=float)
+    w = np.array([p[2] for p in positions], dtype=float)
+    h = np.array([p[3] for p in positions], dtype=float)
+    is_pre, clust_id, bcode = P["is_pre"], P["clust_id"], P["bcode"]
+    floor = 0.0 if P.get("nonneg", False) else None
+    x, y = legalize(x, y, w, h, is_pre, floor=floor)
+    for _ in range(P.get("rounds", 3)):
+        x, y = grouping_repair(x, y, w, h, clust_id, is_pre, floor=floor)
+        x, y = boundary_snap(x, y, w, h, bcode, is_pre, floor=floor)
+    x, y = remove_overlap(x, y, w, h, is_pre, nonneg=P.get("nonneg", False))
+    return x, y, w, h
+
+
 def compact_variant(start, P, aware=False):
     """SDS-style compaction + soft shaping of one legalized layout, returned as an
     ADDITIONAL candidate.  solve() ranks it against the un-compacted layout by the

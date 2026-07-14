@@ -22,3 +22,7 @@ submit/*.zip
 
 # 論文
 Papers/
+
+# 產生的圖檔與訓練包(可重新產生,不進版控)
+electro/diag_out/
+m1_train_bundle.tar.gz
