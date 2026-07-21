@@ -160,8 +160,15 @@ class MyOptimizer(FloorplanOptimizer):
         # The solver can't see the GT baseline, so we rank by
         # exp(2*V_rel)*(hpwl/mean + area/mean), mirroring contest cost.  CUDA can't
         # be forked, so on GPU we run seeds sequentially (fast anyway).
-        starts = None
-        if self.parallel and nseeds > 1 and self.device == "cpu":
+        # Two-track parallelism (opt-in, ELECTRO_PARALLEL_TRACKS=1): run the
+        # random-init track and the M1 track in two forked processes (~half the
+        # cores each) so the warm-start's 2nd place() overlaps the random-init
+        # place().  Produces the IDENTICAL candidate set as the sequential path
+        # below, so the ranking and final score are unchanged -- pure speedup.
+        starts = self._parallel_tracks(P, nseeds, init_centers)
+        from_parallel = starts is not None
+
+        if not from_parallel and self.parallel and nseeds > 1 and self.device == "cpu":
             try:
                 electro_parallel.WORK = P
                 nproc = min(nseeds, os.cpu_count() or 1)
@@ -183,7 +190,7 @@ class MyOptimizer(FloorplanOptimizer):
         # exp(2*V_rel)) keeps it only when it is net better -- compaction cuts
         # area_gap but can disturb grouping/boundary, so we let the cost proxy, not a
         # bbox-only test, decide.  Strictly additive: can never worsen the result.
-        if os.environ.get("ELECTRO_COMPACT", "0") == "1":
+        if not from_parallel and os.environ.get("ELECTRO_COMPACT", "0") == "1":
             # plain (max squeeze) + S1 constraint-aware (rigid clusters + boundary
             # re-snap) -- the ranking picks the best of {none, plain, S1} per case.
             starts = starts + [electro_parallel.compact_variant(s, P, aware=False)
@@ -195,7 +202,7 @@ class MyOptimizer(FloorplanOptimizer):
         # autoregressive rollout with exact legality masking -> zero-overlap
         # layout, added as ANOTHER candidate for the same cost-aware ranking.
         # Strictly additive; needs trained weights (ml/weights/m1_*.pt).
-        if os.environ.get("ELECTRO_M1", "0") == "1":
+        if not from_parallel and os.environ.get("ELECTRO_M1", "0") == "1":
             m1 = self._m1_candidate(block_count, area_targets, constraints,
                                     target_positions, b2b_connectivity,
                                     p2b_connectivity, pins_pos)
@@ -249,6 +256,71 @@ class MyOptimizer(FloorplanOptimizer):
         )
         return [(float(x[i]), float(y[i]), float(w[i]), float(h[i]))
                 for i in range(block_count)]
+
+    def _m1_weights_and_dir(self):
+        """Resolve (ml_dir, m1_weights_path) and put ml_dir on sys.path.  Pure path
+        resolution -- touches no torch -- so it is safe to call in the parent right
+        before forking the parallel tracks."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        ml_dir = None
+        for d in (os.environ.get("ELECTRO_ML_DIR"), here, os.path.dirname(here)):
+            if d and os.path.isdir(os.path.join(d, "ml")):
+                ml_dir = d
+                break
+        if ml_dir is None:
+            return None, None
+        if ml_dir not in sys.path:
+            sys.path.insert(0, ml_dir)
+        weights = os.environ.get(
+            "ELECTRO_M1_WEIGHTS", os.path.join(ml_dir, "ml", "weights", "m1_v1.pt"))
+        return ml_dir, weights
+
+    def _parallel_tracks(self, P, nseeds, init_centers):
+        """Run Track A (random-init place) and Track B (M1 rollout + warm-start) in
+        two forked processes with ~half the cores each, hiding the warm-start's extra
+        place() behind the random-init place().  Returns the merged candidate list
+        (SAME set as sequential -> identical ranking/score) or None to fall back.
+
+        Gated to keep the parent OpenMP-clean before the fork (libgomp fork hazard):
+        opt-in flag, cpu only, no ML-init in the parent, and M1 enabled."""
+        if (os.environ.get("ELECTRO_PARALLEL_TRACKS", "0") != "1"
+                or self.device != "cpu" or init_centers is not None
+                or os.environ.get("ELECTRO_M1", "0") != "1"):
+            return None
+        _, weights = self._m1_weights_and_dir()
+        if weights is None:
+            return None
+        try:
+            Pw = dict(P)
+            Pw["nseeds"] = nseeds
+            pool = self._get_track_pool()
+            ra = pool.apply_async(electro_parallel.track_random, (Pw,))
+            rb = pool.apply_async(electro_parallel.track_m1, (Pw, weights))
+            cand = ra.get(timeout=300) + rb.get(timeout=300)
+            return cand or None
+        except Exception as e:
+            sys.stderr.write(f"[electro] parallel tracks failed ({e}); sequential\n")
+            # Pool may be wedged (e.g. a worker died) -- drop it so the NEXT case
+            # gets a fresh pool instead of repeating the same failure all run.
+            self._track_pool = None
+            return None
+
+    def _get_track_pool(self):
+        """Lazily create ONE persistent 2-worker spawn Pool, reused for every case
+        in this evaluation run.  SPAWN (not fork): the harness imports torch before
+        solve() is ever called, so a forked worker inherits a locked libgomp mutex
+        and deadlocks (confirmed empirically) -- spawn starts clean interpreters.
+        Persistent (not per-case) because spawn's interpreter-startup + model-load
+        cost is real (~seconds); paying it once for the whole run, not once per
+        case, is what makes this a net win instead of a net loss."""
+        if getattr(self, "_track_pool", None) is not None:
+            return self._track_pool
+        threads = int(os.environ.get(
+            "ELECTRO_TRACK_THREADS", str(max(1, (os.cpu_count() or 2) // 2))))
+        ctx = mp.get_context("spawn")
+        self._track_pool = ctx.Pool(2, initializer=electro_parallel.pool_init,
+                                    initargs=(threads,))
+        return self._track_pool
 
     def _m1_candidate(self, block_count, area_targets, constraints,
                       target_positions, b2b, p2b, pins):

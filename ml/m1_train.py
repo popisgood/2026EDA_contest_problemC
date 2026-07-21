@@ -18,15 +18,40 @@ from __future__ import annotations
 
 import argparse
 import math
+import random
 import time
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .m1_common import GRID
 from .m1_dataset import M1Steps
+from .m1_infer import rollout_layout
 from .m1_model import M1Net
+
+
+@torch.no_grad()
+def build_ss_cache(model, dataset, n_cases, device):
+    """Scheduled sampling: roll out the CURRENT model on a sample of training cases
+    and return {cid: positions [n,2] lower-left}.  Sorted cids keep the dataset's
+    one-file cache warm.  deadend='stub' so a stuck rollout never aborts cache build."""
+    ids = dataset.case_ids
+    if len(ids) > n_cases:
+        ids = random.sample(ids, n_cases)
+    ids = sorted(ids)
+    was_training = model.training
+    model.eval()
+    cache = {}
+    for cid in ids:
+        case = dataset._case(cid)
+        x, y, _, _ = rollout_layout(model, case, case["area"], device=device,
+                                    deadend="stub")
+        cache[cid] = np.stack([x, y], axis=1)
+    if was_training:
+        model.train()
+    return cache
 
 
 def near_acc(logits, target):
@@ -86,6 +111,15 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="ml/weights/m1_v1.pt")
     ap.add_argument("--resume", default=None)
+    # scheduled sampling (fixes exposure bias): after --ss-warmup-epochs of pure
+    # teacher forcing, each epoch roll out the current model on --ss-cases training
+    # cases and feed those positions back as context w.p. p, where p ramps linearly
+    # 0 -> --ss-max-p over the remaining epochs.  Best used with --resume from an
+    # already-trained checkpoint (the rollout must be meaningful, not noise).
+    ap.add_argument("--scheduled-sampling", action="store_true")
+    ap.add_argument("--ss-warmup-epochs", type=int, default=1)
+    ap.add_argument("--ss-max-p", type=float, default=0.4)
+    ap.add_argument("--ss-cases", type=int, default=5000)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -113,6 +147,21 @@ def main():
     best = math.inf
     for ep in range(1, args.epochs + 1):
         t0 = time.time()
+        # scheduled sampling: build this epoch's rollout cache + ramp p (only after
+        # the warmup epochs, and only if there are epochs left to ramp over).
+        if args.scheduled_sampling:
+            p = 0.0
+            if ep > args.ss_warmup_epochs and args.epochs > args.ss_warmup_epochs:
+                frac = (ep - args.ss_warmup_epochs) / (args.epochs - args.ss_warmup_epochs)
+                p = args.ss_max_p * min(1.0, frac)
+            if p > 0.0:
+                tc = time.time()
+                cache = build_ss_cache(model, train_ds, args.ss_cases, args.device)
+                train_ds.set_scheduled_sampling(cache, p)
+                print(f"[m1] ep{ep} scheduled-sampling p={p:.2f} "
+                      f"cache={len(cache)} in {time.time()-tc:.0f}s", flush=True)
+            else:
+                train_ds.set_scheduled_sampling(None, 0.0)
         tr = run_epoch(model, tl, opt, args.device, train=True)
         va = run_epoch(model, vl, opt, args.device, train=False)
         print(f"[m1] ep{ep}  train pos={tr['pos']:.3f} acc={tr['acc']:.3f} "

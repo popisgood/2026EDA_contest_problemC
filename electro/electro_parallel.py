@@ -12,6 +12,7 @@ created, so the fork inherits them and we never pickle the connectivity tensors.
 from __future__ import annotations
 
 import os
+import sys
 
 import numpy as np
 
@@ -19,7 +20,8 @@ from analytical_place import place
 from legalize import legalize, remove_overlap
 from soft_repair import boundary_snap, grouping_repair
 
-WORK = None   # per-case inputs, set by the parent before forking the pool
+WORK = None     # per-case inputs, set by the parent before forking the pool
+M1_CFG = None   # M1 weights path, set by the parent before forking the tracks pool
 
 
 def run_start(seed, P):
@@ -61,9 +63,14 @@ def m1_warmstart_variant(m1_pos, P):
                                 dtype=torch.float32)
     init_la = torch.tensor(np.log(np.clip(w0, 1e-6, None) / np.clip(h0, 1e-6, None)),
                            dtype=torch.float32)
+    # T8: the warm-start starts from M1's already-legal, roughly-arranged layout,
+    # so it needs FAR fewer gradient steps than a random start (which spends most of
+    # its 600 iters just untangling the initial mess).  ELECTRO_WARMSTART_ITERS caps
+    # it; default = the full iters (no change until set / tuned).
+    ws_iters = int(os.environ.get("ELECTRO_WARMSTART_ITERS", P["iters"]))
     positions, _ = place(
         P["n"], P["area"], P["b2b"], P["p2b"], P["pins"], P["cons"], P["tp"],
-        iters=P["iters"], lr=P["lr"], device=P["device"], seed=0,
+        iters=ws_iters, lr=P["lr"], device=P["device"], seed=0,
         init_centers=init_centers, init_la=init_la)
     x = np.array([p[0] for p in positions], dtype=float)
     y = np.array([p[1] for p in positions], dtype=float)
@@ -122,3 +129,66 @@ def pool_init(threads=1):
 
 def seed_worker(seed):
     return run_start(seed, WORK)
+
+
+# ---- two-track parallelism (ELECTRO_PARALLEL_TRACKS): hide the M1 warm-start's
+# second place() behind the random-init place() by running them concurrently.
+# Both read the per-case P from the WORK global (inherited via fork), and each
+# reproduces EXACTLY its slice of the sequential candidate set, so the merged
+# result is identical -- pure perf, score unchanged.
+
+def _as_arrays(pos):
+    return (np.array([p[0] for p in pos], float), np.array([p[1] for p in pos], float),
+            np.array([p[2] for p in pos], float), np.array([p[3] for p in pos], float))
+
+
+def track_random(P):
+    """Track A: the random-init place() start(s) + their compaction variants.
+    P is passed explicitly (spawn children don't inherit module globals)."""
+    out = [run_start(s, P) for s in range(P.get("nseeds", 1))]
+    if os.environ.get("ELECTRO_COMPACT", "0") == "1":
+        base = list(out)
+        out = out + [compact_variant(s, P, aware=False) for s in base] \
+                  + [compact_variant(s, P, aware=True) for s in base]
+    return out
+
+
+_M1_CACHE = {}   # {weights_path: M1Predictor}, persists across tasks THIS worker
+                 # process handles over the pool's lifetime (loaded at most once
+                 # per worker, not once per case -- the pool itself is persistent).
+
+
+def track_m1(P, weights):
+    """Track B: M1 rollout + its compaction variants + M1 warm-start place() + its
+    compaction variants.  Runs in a SPAWNed process (fresh interpreter, no inherited
+    OpenMP lock -- fork deadlocks here because the contest harness runs torch before
+    solve()).  Returns [] if M1 is unavailable/fails, so the parent still gets Track
+    A's candidates -- strictly additive."""
+    out = []
+    try:
+        from ml.m1_infer import M1Predictor
+        pred = _M1_CACHE.get(weights)
+        if pred is None:
+            pred = M1Predictor(weights, device="cpu")
+            _M1_CACHE[weights] = pred
+        if not pred.available():
+            return out
+        pos = pred.predict(P["n"], P["area"], P["cons"], P["tp"],
+                           P["b2b"], P["p2b"], P["pins"])
+        if pos is None:
+            return out
+        m1 = _as_arrays(pos)
+        out.append(m1)
+        compact = os.environ.get("ELECTRO_COMPACT", "0") == "1"
+        if compact:
+            out.append(compact_variant(m1, P, aware=False))
+            out.append(compact_variant(m1, P, aware=True))
+        if os.environ.get("ELECTRO_M1_WARMSTART", "0") == "1":
+            ws = m1_warmstart_variant(m1, P)
+            out.append(ws)
+            if compact:
+                out.append(compact_variant(ws, P, aware=False))
+                out.append(compact_variant(ws, P, aware=True))
+    except Exception as e:
+        sys.stderr.write(f"[electro] track_m1 failed ({e})\n")
+    return out

@@ -8,13 +8,16 @@
 
 ## 0. 現況與已確立的事實
 
-**現況**（真評測器、full-100）：
+**現況**（真評測器、full-100，2026-07-15 更新）：
 
 | 指標 | 數值 |
 |---|---|
-| Total Score（v10 加權） | **2.8414**（compaction ON，commit `0c665b0`）；OFF = 2.9660 |
+| Total Score（v10 加權） | **2.3757**（S1 壓縮 + M1 熱啟動 + 平行化，全部 ON） |
 | feasibility | 100/100 |
-| 每 case 運算時間 | ~5–9 s（n=21→120，seeds=1，CPU） |
+| runtime | 中位數 **4.2 s**、加總 546 s（平行化前 7.5s/821s；最原始提交 ~3.1s 中位數） |
+
+**本 sprint 分數進程**：2.9660(原始提交) → 2.7215(S1壓縮) → **2.3757**(M1熱啟動，−20% 累計)。
+runtime 進程：~3.1s → 6.6s(熱啟動翻倍) → **4.2s**(平行化拉回大部分，仍未回到 3.1s，見 T7)。
 
 **v10 計分要點**（決定所有優先序，勿用 v9 直覺）：
 - `quality = 1 + 0.5·(max(0,hpwl_gap) + max(0,area_gap))` — **贏過 baseline 不加分**（clamp）。
@@ -97,6 +100,19 @@ v10 下小 case 合計 ~28% 權重，而我們小 case cost 仍在 1.87–2.0。
 - 「一次輸出就接近答案」的架構升級路線（建構式自回歸 / few-step 生成式 / 離散表示預測），
   完整調查與建議見 **第 5 節 ML 2.0**。
 
+**✅ M1 v1 已完成訓練並驗證（2026-07-14）**：100k case 訓練到 val near=0.758。**但單獨的 M1
+rollout 從未贏過排名**（診斷出 exposure bias：teacher forcing 準確率漲了，rollout 品質沒跟著漲）。
+**真正拿到分數的是「M1 熱啟動 electro 自己的梯度優化器」**（`place()` 新增 `init_la` 參數，
+用 M1 的位置+長寬比當起點，接著跑真正的梯度下降去清 HPWL/V——不受 M1 的逐步累積誤差影響）。
+Full-100：2.7215 → **2.3757**（−12.7%）。詳見 `ml/M1_README.md`。
+
+**下一個 ML 槓桿（設計完成，未實作）：scheduled sampling** —— 治本修 exposure bias 本身
+（訓練時偶爾餵模型自己的 rollout 當上下文，機率隨 epoch 漸增，不要一開始就 100%——見下方
+「為什麼不要一開始就全部用自己的猜測」）。若做成，可能讓 M1 raw rollout 本身也更好，
+甚至讓熱啟動可以用更少迭代收斂（跟 T8 疊加）。工程量：`ml/m1_infer.py` 加「吃記憶體模型物件」
+建構式、`ml/m1_dataset.py` 加 rollout cache + 機率替換、`ml/m1_train.py` 加每 epoch 前建 cache
+的迴圈。成本估計每 epoch 多 10–25 分鐘（重用現有 rollout 邏輯，不是全新架構）。
+
 ---
 
 ## 2. 運算時間（依投報率排序）
@@ -129,26 +145,50 @@ n≤120 的張量極小，600 iters 的時間主要是 **Python/dispatch 開銷*
 `shape_compact.py` 目前是 O(n²) Python 迴圈（+8% 牆鐘時間）。numpy broadcasting 改寫可到 <1%。
 S1 動這個檔時順手做。
 
-### T5 — GPU seed-batching（條件性）
+### T5 — GPU seed/track-batching（條件性，工程量大）
 
-只有在 multi-start 回歸主力（例如 runtime 便宜、要衝品質）時才值得：把 N 個 seed 疊成 batch 維
-一次算（DREAMPlace 式）。目前 seeds=1，先擱置。
+⚠️ **勿直接把 `place()` 的 `device` 改成 cuda**：程式碼本身有記錄「n≤120 的小張量，600 次序列
+迭代在 GPU 上實測比 CPU 慢 6 倍」（kernel-launch 開銷主導，跟資料量無關的固定延遲，序列丟
+幾千次 kernel 全部虧在這裡）。GPU 真正能贏，只有**把多個起點疊成同一個張量的 batch 維、一組
+迴圈一次 kernel 呼叫處理全部**（DREAMPlace 式）——但這需要把 `place()` 內部所有損失項（線長、
+重疊、bbox、群組、邊界⋯）都重寫成支援 batch 維，工程量、風險都遠大於 T7 的 CPU 多進程版。
+**目前 T7 已經拿到 33–44% 的實測改善、風險低**，這條先擱置，除非 T7+T8 做完仍覺得不夠快。
 
 ### T6 — 先 profile 再動手
 
 動 T3 前先量：600-iter 迴圈 / legalize / repair / 壓縮 各占多少。避免優化錯段（我們在 eDensity
 時踩過「優化非瓶頸段」的坑）。
 
+### ✅ T7 — 雙軌 CPU 平行化（已完成，2026-07-14）
+
+`ELECTRO_PARALLEL_TRACKS=1`：隨機起點軌道、M1(+熱啟動)軌道各分一半核心（`os.cpu_count()//2`）
+同時跑，常駐 `spawn` Pool（`fork` 在這裡會死鎖 —— contest harness 在呼叫 `solve()` 前已經跑過
+torch，parent 不是「OpenMP 乾淨」的，跟舊有 multi-seed 那套的 fork 假設不成立；且 Pool 若每個
+case 重建會被 spawn 的直譯器啟動成本吃光利益，必須常駐在 `self._track_pool` 上）。
+Full-100 驗證：cost **逐 case 完全相同**（0 個差異，純加速、零分數風險），runtime 加總
+821s→546s（**−33%**）、中位數 7.5s→4.2s（**−44%**）。詳見 `electro_parallel.py::track_random/track_m1`。
+
+### T8 — 縮短熱啟動迭代數（下一個最現成的時間槓桿，未做）
+
+T7 平行化後，時間卡在「M1 軌道」——它比隨機起點軌道多做 M1 rollout + 熱啟動 `place()`
+（跟隨機起點一樣跑滿 600 次），是兩軌道中較重的那個，平行化的天花板被它卡住。但熱啟動的
+起點是 M1 給的、已經合法/排得七七八八的排版，**理論上不需要跑滿 600 次**——砍到
+150–250 次做「精修」應該就夠。這樣兩軌道更平衡，平行化天花板會更接近真正的單次 `place()`
+時間（更接近原始的 ~3.1s 中位數）。跟 T7 疊加、互不衝突。
+
 ---
 
 ## 3. 建議執行順序（兩週節奏）
 
-| 週 | 項目 | 驗收 |
-|---|---|---|
-| W1 | **S1** 群組/邊界感知壓縮 | subset 被拒 case 轉為採納；full-100 < 2.7 |
-| W1 | **T1+T2** 早停 + iters 排程 | 平均 case 時間 −30%，full-100 分數不退 |
-| W2 | **S3** place↔compact 迭代（或 S2 SDS 完整版，二選一先做） | full-100 再 −0.1 以上 |
-| W2 | **T6→T3** profile + torch.compile 實驗 | 平均 case < 3 s |
+| 週 | 項目 | 驗收 | 狀態 |
+|---|---|---|---|
+| ~~W1~~ | ~~**S1** 群組/邊界感知壓縮~~ | full-100 < 2.7 | ✅ 完成，2.7215 |
+| ~~—~~ | ~~**M1 訓練 + 熱啟動**~~ | full-100 再降 | ✅ 完成，**2.3757** |
+| ~~—~~ | ~~**T7** 雙軌 CPU 平行化~~ | runtime −30% 以上、分數不變 | ✅ 完成，−33%/−44% |
+| **下一步** | **T8** 縮短熱啟動迭代數 | 平行化天花板更接近 3.1s | 未做，最現成 |
+| **下一步** | scheduled sampling | M1 raw 品質提升，可能連動縮短熱啟動 | 已設計，未做 |
+| 之後 | S2 SDS 完整塑形 / S4 小 case portfolio | 救 tid40-類殘餘 case | 未做 |
+| 之後 | T3 torch.compile / T6 profile | 平均 case < 3 s | 未做 |
 | W2 起（平行） | **M1 建構式模仿訓練**（第 5 節；M3 probe 已做並出局） | M1 出首版權重後與 electro 同台當候選 |
 | 之後 | S4 小 case portfolio、S5 收尾精修、S6 分段掃描 | 逐項 A/B |
 

@@ -66,6 +66,20 @@ class M1Steps(Dataset):
         self._cache_cid = -1
         self._cache = None
 
+        # Scheduled sampling: {cid: rollout positions [n,2] lower-left} + a mix
+        # probability.  When set, __getitem__ replaces each placed block's GT
+        # context position with the model's own rollout position w.p. ss_p, so the
+        # model learns to predict the correct next placement from IMPERFECT context
+        # (fixes the exposure bias where teacher-forced accuracy doesn't transfer to
+        # rollout).  Targets stay GT.  Set per-epoch by the trainer; None = pure
+        # teacher forcing (default / warmup).
+        self._ss_cache = None
+        self._ss_p = 0.0
+
+    def set_scheduled_sampling(self, cache, p):
+        self._ss_cache = cache
+        self._ss_p = float(p)
+
     def __len__(self):
         return len(self.samples)
 
@@ -100,6 +114,7 @@ class M1Steps(Dataset):
             pins_np = pins_np[pins_np[:, 0] != -1] if len(pins_np) else None
         case = prep_case(area, cons5, _np_edges(b2b), _np_edges(p2b),
                          pins_np, Wc, Hc, gt_xywh=gt)
+        case["area"] = area                       # rollout_layout needs it (SS)
         case["gt"] = gt
         case["cells"] = np.array(
             [cell_of(gt[i, 0], gt[i, 1], Wc, Hc) for i in range(n)], dtype=np.int64)
@@ -120,6 +135,17 @@ class M1Steps(Dataset):
         for j in order[:t]:
             placed[j] = True
         xy = case["gt"][:, :2]                   # teacher forcing: GT positions
+        # Scheduled sampling: swap each placed (non-preplaced) block's GT context
+        # position for the model's own rollout position w.p. ss_p.  Only positions
+        # are mixed (dims stay GT) -- position is the dominant context signal.
+        if self._ss_cache is not None and self._ss_p > 0.0:
+            roll = self._ss_cache.get(cid)
+            if roll is not None:
+                flip = (np.random.random(len(xy)) < self._ss_p) & placed \
+                    & (~case["is_pre"])
+                if flip.any():
+                    xy = xy.copy()
+                    xy[flip] = roll[flip]
         tokens, pad = step_tokens(case, placed, xy, cur)
 
         asp = int(case["bins"][cur]) if case["is_soft"][cur] else -100  # ignore

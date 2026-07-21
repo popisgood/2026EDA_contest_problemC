@@ -33,6 +33,65 @@ def _np_edges(t):
     return a if len(a) else None
 
 
+@torch.no_grad()
+def rollout_layout(model, case, area, device="cpu", deadend="none"):
+    """Autoregressive masked rollout over a PREPPED case dict (from prep_case).
+    Returns (x, y, w, h) numpy arrays [n].  Shared by inference (M1Predictor.predict)
+    and by scheduled-sampling cache building in training (feed the model its own
+    rollout back as context).  Does NOT mutate the caller's case dict.
+
+    deadend: if a block has no legal cell even after growing the canvas --
+      "none" -> return None (inference; caller falls back to electro)
+      "stub" -> place it at the origin and keep going (training cache; never abort)."""
+    case = dict(case)          # shallow copy: rebind w/h/Wc/Hc locally only
+    n = case["n"]
+    Wc, Hc = case["Wc"], case["Hc"]
+    w = np.asarray(case["w"], float).copy()
+    h = np.asarray(case["h"], float).copy()
+    x = np.asarray(case["px"], float).copy()
+    y = np.asarray(case["py"], float).copy()
+    placed_mask = np.asarray(case["is_pre"], bool).copy()
+    placed_list = [(x[i], y[i], w[i], h[i]) for i in range(n) if placed_mask[i]]
+    mib_bin = {}
+    for cur in case["order"]:
+        case["w"], case["h"] = w, h            # tokens see current dims
+        tokens, pad = step_tokens(case, placed_mask, np.stack([x, y], 1), cur)
+        tt = torch.from_numpy(tokens)[None].to(device)
+        pp = torch.from_numpy(pad)[None].to(device)
+        ci = torch.tensor([cur], device=device)
+        pos_logits, asp_logits = model(tt, pp, ci)
+        pos_logits = pos_logits[0].detach().cpu().numpy()
+        if case["is_soft"][cur]:               # choose shape first
+            g = int(case["mib"][cur])
+            if g > 0 and g in mib_bin:
+                k = mib_bin[g]
+            else:
+                k = int(asp_logits[0].argmax())
+                if g > 0:
+                    mib_bin[g] = k
+            w[cur], h[cur] = bin_to_wh(k, area[cur])
+        mask = legality_mask(w[cur], h[cur], placed_list, Wc, Hc)
+        tries = 0
+        while not mask.any() and tries < 4:    # dead-end: grow canvas
+            Wc *= 1.10
+            Hc *= 1.10
+            case["Wc"], case["Hc"] = Wc, Hc
+            mask = legality_mask(w[cur], h[cur], placed_list, Wc, Hc)
+            tries += 1
+        if not mask.any():
+            if deadend == "none":
+                return None
+            bx, by = 0.0, 0.0
+        else:
+            pos_logits[~mask] = -1e30
+            bx, by = cell_to_xy(int(pos_logits.argmax()), Wc, Hc)
+            bx, by = snap(bx, by, w[cur], h[cur], placed_list, Wc, Hc)
+        x[cur], y[cur] = bx, by
+        placed_mask[cur] = True
+        placed_list.append((bx, by, w[cur], h[cur]))
+    return x, y, w, h
+
+
 class M1Predictor:
     def __init__(self, weights_path: str, device: str = "cpu"):
         self.device = device
@@ -82,49 +141,10 @@ class M1Predictor:
 
         case = prep_case(area, cons5, _np_edges(b2b), _np_edges(p2b), pv,
                          Wc, Hc, tp=tp)
-        w, h = case["w"].copy(), case["h"].copy()
-        x = case["px"].copy()
-        y = case["py"].copy()
-        placed_mask = case["is_pre"].copy()
-        placed_list = [(x[i], y[i], w[i], h[i]) for i in range(n) if placed_mask[i]]
-        mib_bin = {}                            # MIB group -> shared aspect bin
-
-        for cur in case["order"]:
-            case["w"], case["h"] = w, h         # tokens see current dims
-            tokens, pad = step_tokens(case, placed_mask,
-                                      np.stack([x, y], 1), cur)
-            tt = torch.from_numpy(tokens)[None].to(self.device)
-            pp = torch.from_numpy(pad)[None].to(self.device)
-            ci = torch.tensor([cur], device=self.device)
-            pos_logits, asp_logits = self.model(tt, pp, ci)
-            pos_logits = pos_logits[0].cpu().numpy()
-
-            if case["is_soft"][cur]:            # choose shape first
-                g = int(case["mib"][cur])
-                if g > 0 and g in mib_bin:
-                    k = mib_bin[g]
-                else:
-                    k = int(asp_logits[0].argmax())
-                    if g > 0:
-                        mib_bin[g] = k
-                w[cur], h[cur] = bin_to_wh(k, area[cur])
-
-            mask = legality_mask(w[cur], h[cur], placed_list, Wc, Hc)
-            tries = 0
-            while not mask.any() and tries < 4:  # dead-end: grow canvas
-                Wc *= 1.10
-                Hc *= 1.10
-                case["Wc"], case["Hc"] = Wc, Hc
-                mask = legality_mask(w[cur], h[cur], placed_list, Wc, Hc)
-                tries += 1
-            if not mask.any():
-                return None                      # give up; caller falls back
-            pos_logits[~mask] = -1e30
-            bx, by = cell_to_xy(int(pos_logits.argmax()), Wc, Hc)
-            bx, by = snap(bx, by, w[cur], h[cur], placed_list, Wc, Hc)
-            x[cur], y[cur] = bx, by
-            placed_mask[cur] = True
-            placed_list.append((bx, by, w[cur], h[cur]))
-
+        res = rollout_layout(self.model, case, area, device=self.device,
+                             deadend="none")
+        if res is None:
+            return None                          # dead-end: caller falls back
+        x, y, w, h = res
         return [(float(x[i]), float(y[i]), float(w[i]), float(h[i]))
                 for i in range(n)]
