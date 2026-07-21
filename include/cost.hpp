@@ -83,9 +83,9 @@ struct SAWeights {
 
     Real w_overlap  = 5000.0;  // huge -- overlap is hard
     Real w_softarea = 5000.0;  // huge -- soft-block area-tolerance is hard
-    Real w_group    = 80.0;    // grouping  (was 5; contest cost is exponential in V_rel)
+    Real w_group    = 500.0;    // grouping  (was 5; contest cost is exponential in V_rel)
     Real w_mib      = 80.0;    // MIB
-    Real w_bound    = 80.0;    // boundary
+    Real w_bound    = 200.0;    // boundary
 
     // Aspect-ratio penalty.  Adds w_outline * |log(bbox_w/bbox_h)| to sa_cost.
     // Reverted to 0 by default: the terminal extent (via w_hpwl_ext) already

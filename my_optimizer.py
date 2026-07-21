@@ -154,16 +154,41 @@ def _write_txt(
         for b in group:
             block_to_cluster_ordinal[b] = ord_
 
+    # ---- Baseline estimation ------------------------------------------------
+    #
+    # The C++ solver normalises area / HPWL by these baselines so that SA's
+    # sa_cost stays in a reasonable scale (~1-10 per term).  Without them
+    # cost.cpp falls back to abase = hbase = 1.0 and raw area_bbox (~50000)
+    # dominates -- T1 calibrates to ~50000 instead of ~5, and Metropolis's
+    # exp(-Δ/T) collapses to ~1 (SA accepts everything = random walk).
+    #
+    # Heuristics:
+    #   baseline_area = sum(block_area) * 1.10  (10% whitespace headroom)
+    #   baseline_hpwl = total_net_weight * (sqrt(area) * 0.5)
+    #                   (assume each net spans ~half the bbox side)
+    total_area = float(area_targets[:block_count].sum().item()) if block_count > 0 else 0.0
+    baseline_area = total_area * 1.10 if total_area > 0 else 1.0
+
+    side = math.sqrt(baseline_area) if baseline_area > 0 else 1.0
+    avg_edge = side * 0.5
+
+    total_net_weight = 0.0
+    if valid_b2b is not None and valid_b2b.numel() > 0:
+        total_net_weight += float(valid_b2b[:, 2].sum().item())
+    if valid_p2b is not None and valid_p2b.numel() > 0:
+        total_net_weight += float(valid_p2b[:, 2].sum().item())
+    baseline_hpwl = (total_net_weight * avg_edge) if total_net_weight > 0 else side
+
     with open(out_path, "w") as f:
         f.write("# emitted by my_optimizer.py for the ICCAD 2026 contest\n")
         f.write(f"N_BLOCKS    {block_count}\n")
         f.write(f"N_TERMINALS {n_pins}\n")
-        # The framework computes its own baselines from ground truth.
-        # Our solver only uses BASELINE_HPWL/BASELINE_AREA for its internal
-        # cost shaping — leaving them at 0 is fine; the SA still optimises
-        # the right things.
-        f.write("BASELINE_HPWL 0.0\n")
-        f.write("BASELINE_AREA 0.0\n")
+        # Baselines: the framework computes its OWN baselines from ground
+        # truth for the final contest_cost score, so the values here ONLY
+        # affect the solver's internal SA cost function (which needs them
+        # to keep magnitudes in a sane scale -- see comment above).
+        f.write(f"BASELINE_HPWL {baseline_hpwl:.6f}\n")
+        f.write(f"BASELINE_AREA {baseline_area:.6f}\n")
         f.write("OUTLINE 0.0 0.0\n")
 
         if n_pins > 0:
@@ -315,9 +340,17 @@ class MyOptimizer(FloorplanOptimizer):
             self.binary = cand if cand.exists() else Path("./floorplanner").resolve()
 
         self.threads = int(os.environ.get("FLOORPLANNER_THREADS", "8"))
-        self.time_expr = os.environ.get("FLOORPLANNER_TIME", "5+0.5*n")
+        self.time_expr = os.environ.get("FLOORPLANNER_TIME", "8+1.0*n")
         self.seed = int(os.environ.get("FLOORPLANNER_SEED", "1"))
         self.keep = os.environ.get("FLOORPLANNER_KEEP", "0") == "1"
+
+        # Feasibility-triggered budget escalation.  When the solver returns
+        # rc=4 (ran fine but the best solution is still infeasible -> cost M=10),
+        # re-run that one case with a larger budget instead of shipping a
+        # cost-10 result.  Keeps the aggressive short budget on the easy cases
+        # while rescuing the few large/dense ones.  Disable with
+        # FLOORPLANNER_ESCALATE=0.
+        self.escalate = os.environ.get("FLOORPLANNER_ESCALATE", "1") != "0"
 
         # Workdir survives across solve() calls so we can inspect after a run
         self.workdir = Path(tempfile.mkdtemp(prefix="my_optimizer_"))
@@ -348,7 +381,7 @@ class MyOptimizer(FloorplanOptimizer):
         try:
             time_s = float(eval(self.time_expr, {"__builtins__": {}}, {"n": block_count}))
         except Exception:
-            time_s = 5.0 + 0.5 * block_count
+            time_s = 8.0 + 1.0 * block_count
         time_s = max(1.0, min(time_s, 300.0))
 
         idx = self._call_idx
@@ -359,40 +392,87 @@ class MyOptimizer(FloorplanOptimizer):
         _write_txt(in_txt, block_count, area, b2b_connectivity,
                    p2b_connectivity, pins_pos, cons, tp)
 
-        cmd = [
-            str(self.binary), str(in_txt), str(out_sol),
-            "--time",    f"{time_s:g}",
-            "--threads", str(self.threads),
-            "--seed",    str(self.seed + idx),
-        ]
-
         if self.verbose:
             print(f"[my_optimizer] case {idx}: n={block_count} budget={time_s:.1f}s",
                   file=sys.stderr)
 
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            sys.stderr.write(
-                f"[my_optimizer] solver binary not found: {self.binary}\n"
-                f"  Set FLOORPLANNER_BIN, or place the binary next to my_optimizer.py.\n"
-            )
-            return self._fallback(block_count, area)
-
-        if res.returncode != 0:
-            sys.stderr.write(
-                f"[my_optimizer] case {idx}: solver exited with rc={res.returncode}\n"
-                + (res.stderr[-2000:] if res.stderr else "") + "\n"
-            )
-            return self._fallback(block_count, area)
-
-        positions = _parse_sol(out_sol, block_count, area)
+        positions = self._run_solver(in_txt, out_sol, block_count, time_s, idx, area)
 
         if not self.keep:
             in_txt.unlink(missing_ok=True)
             out_sol.unlink(missing_ok=True)
 
         return positions
+
+    def _run_solver(self, in_txt: Path, out_sol: Path, block_count: int,
+                    base_time_s: float, idx: int,
+                    area: torch.Tensor) -> List[Tuple[float, float, float, float]]:
+        """Run the C++ solver, escalating the time budget on infeasibility.
+
+        The binary returns rc=0 (feasible), rc=4 (ran fine but best solution
+        infeasible -> contest cost M=10), or another code on a real error.
+        Because an infeasible case costs the maximum penalty, on the few hard
+        cases it is always worth re-running with more time; the cheap cases
+        keep the fast budget and never escalate.  The same input file (and any
+        WARM_POSITIONS hint already appended to it) is reused on every attempt.
+        """
+        # Build the escalation ladder.  Rung 1 is the configured budget; rung 2
+        # is a "safe" budget known to legalise the large/dense cases.
+        budgets = [base_time_s]
+        if self.escalate:
+            floor = float(os.environ.get("FLOORPLANNER_ESCALATE_FLOOR", "60"))
+            cap   = float(os.environ.get("FLOORPLANNER_ESCALATE_CAP", "90"))
+            safe  = min(cap, max(floor, 0.6 * block_count))
+            if safe > base_time_s * 1.3:
+                budgets.append(safe)
+
+        best_effort: Optional[List[Tuple[float, float, float, float]]] = None
+        for attempt, budget in enumerate(budgets):
+            # Vary the seed across escalation rungs so each retry is an
+            # INDEPENDENT draw, not just more time on the same (possibly
+            # unlucky) 8-thread population.  Feasibility on large/dense
+            # anchored cases is strongly seed-dependent, so independent rungs
+            # multiply the odds of landing a feasible arrangement.
+            cmd = [
+                str(self.binary), str(in_txt), str(out_sol),
+                "--time",    f"{budget:g}",
+                "--threads", str(self.threads),
+                "--seed",    str(self.seed + idx + attempt * 7919),
+            ]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except FileNotFoundError:
+                sys.stderr.write(
+                    f"[my_optimizer] solver binary not found: {self.binary}\n"
+                    f"  Set FLOORPLANNER_BIN, or place the binary next to my_optimizer.py.\n"
+                )
+                return self._fallback(block_count, area)
+
+            if res.returncode == 0:
+                return _parse_sol(out_sol, block_count, area)          # feasible
+
+            if res.returncode == 4:
+                # Infeasible, but a real best-effort layout was written.  Keep
+                # it and escalate to a larger budget if one remains.
+                best_effort = _parse_sol(out_sol, block_count, area)
+                if self.verbose:
+                    nxt = (f"; escalating to {budgets[attempt + 1]:g}s"
+                           if attempt + 1 < len(budgets) else "")
+                    sys.stderr.write(
+                        f"[my_optimizer] case {idx}: infeasible at {budget:g}s{nxt}\n"
+                    )
+                continue
+
+            sys.stderr.write(
+                f"[my_optimizer] case {idx}: solver exited with rc={res.returncode}\n"
+                + (res.stderr[-2000:] if res.stderr else "") + "\n"
+            )
+            return self._fallback(block_count, area)
+
+        # Exhausted the ladder while still infeasible: return the real layout
+        # (cost M either way, but a true placement is never worse than the
+        # overlapping-squares emergency fallback).
+        return best_effort if best_effort is not None else self._fallback(block_count, area)
 
     @staticmethod
     def _fallback(block_count: int, area: torch.Tensor):

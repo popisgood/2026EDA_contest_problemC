@@ -158,7 +158,39 @@ bool load_instance(const std::string& path, FloorplanInstance& inst, std::string
                 }
             }
         }
-        else if (tok == "END") break;
+        else if (tok == "WARM_POSITIONS") {
+            // ML predictor hint (my_optimizer_ml.py).  One row per block:
+            //   <id> <cx> <cy> <w> <h>
+            int m; if (!rd(m)) return false;
+            inst.has_warm = true;
+            inst.warm_cx.assign(inst.n_blocks, 0.0);
+            inst.warm_cy.assign(inst.n_blocks, 0.0);
+            inst.warm_w.assign(inst.n_blocks, 0.0);
+            inst.warm_h.assign(inst.n_blocks, 0.0);
+            for (int i = 0; i < m; ++i) {
+                int id; Real cx, cy, w, h;
+                if (!rd(id) || !rd(cx) || !rd(cy) || !rd(w) || !rd(h)) return false;
+                if (id >= 0 && id < inst.n_blocks) {
+                    inst.warm_cx[id] = cx; inst.warm_cy[id] = cy;
+                    inst.warm_w[id]  = w;  inst.warm_h[id]  = h;
+                }
+            }
+        }
+        else if (tok == "WARM_PRIORITY") {
+            int m; if (!rd(m)) return false;
+            inst.warm_priority.resize(m);
+            for (int i = 0; i < m; ++i) {
+                int id; if (!rd(id)) return false;
+                inst.warm_priority[i] = id;
+            }
+        }
+        else if (tok == "END") {
+            // Historically END terminated parsing.  The ML pipeline appends
+            // WARM_POSITIONS / WARM_PRIORITY *after* END, so we no longer stop
+            // here -- we keep reading until EOF.  Unknown trailing tokens are
+            // tolerated below, so this remains safe for legacy (non-ML) inputs.
+            continue;
+        }
         else {
             // tolerate unknown tokens (forward compat)
         }

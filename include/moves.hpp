@@ -37,17 +37,35 @@ enum class MoveKind { Rotate, Move, Swap, AspectRatio, MibSync, FixBoundary, Fix
 //   * Set p_ar / p_rot higher for low-Δ exploration; set p_fixb / p_fixg
 //     higher when V_boundary / V_grouping stay high after SA.
 struct MoveProb {
-    double p_fixb = 0.05;   // FixBoundary  (always-accept constraint repair)
-    double p_fixg = 0.05;   // FixGrouping  (always-accept constraint repair)
-    double p_ar   = 0.18;   // AspectRatio  (re-sample (w,h) of soft block)
+    // Move-mix rebalanced after the deterministic boundary/grouping repair
+    // passes (packer.cpp) took over most constraint satisfaction.  The
+    // stochastic FixBoundary/FixGrouping moves now do less unique work, so we
+    // shift that probability budget to quality-improving moves: AspectRatio
+    // (area/HPWL shaping) and the big-Δ subtree Move (the remainder).
+    double p_fixb = 0.02;   // FixBoundary  (was 0.05; repair pass handles most)
+    double p_fixg = 0.02;   // FixGrouping  (was 0.05; repair pass handles most)
+    double p_ar   = 0.22;   // AspectRatio  (was 0.18; more (w,h) shaping)
     double p_mib  = 0.05;   // MibSync      (sync (w,h) across whole MIB group)
     double p_rot  = 0.15;   // Rotate       (swap w↔h)
     double p_swp  = 0.15;   // Swap         (exchange two tree positions)
-    // remainder ≈ 0.37 goes to MoveKind::Move (subtree graft, biggest Δ)
+    // remainder ≈ 0.39 goes to MoveKind::Move (subtree graft, biggest Δ)
 
     // AspectRatio move samples area in [a·(1−tol_ar), a·(1+tol_ar)].
     // Hard area tolerance is 1%; keep tol_ar < 0.01 for margin.
     double tol_ar = 0.005;
+
+    // SA-side aspect-ratio clamp.  Block's own ar_min/ar_max comes from the
+    // contest input (typically 0.25–4.0, i.e. up to 4:1 extreme).  Letting SA
+    // explore the full range produces very elongated blocks that take a lot
+    // of width and disrupt cluster abutment — exactly the case-56 visual
+    // symptom.  We tighten the SA-side range to a subset:
+    //   eff_ar_min = max(b.ar_min, 1/sa_ar_clamp)
+    //   eff_ar_max = min(b.ar_max,   sa_ar_clamp)
+    //   2.0  = blocks stay within [1:2 .. 2:1]  (recommended)
+    //   3.0  = mild clamp [1:3 .. 3:1]
+    //   1.0  = forced square (probably too aggressive, area_target won't fit)
+    //   0    = disable clamp, use block's full ar_min/ar_max range (legacy)
+    double sa_ar_clamp = 2.0;
 };
 
 struct Move {

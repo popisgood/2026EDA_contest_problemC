@@ -39,14 +39,14 @@ struct SACooling {
     // Step index where stage 2 ends and stage 3 begins.  Equivalent to the
     // FastSA paper's K constant.  Stage 2 is 1 .. K2-1 steps long; stage 3
     // runs until time/stagnation termination.
-    int    stage2_end_k = 9;
+    int    stage2_end_k = 7;
 
     // Per-step geometric multipliers.  T_new = T_old * alpha.
     //   stage1 = 1.0: T held at T1 throughout stage 1 (just one step by default)
     //   stage2 = 0.85: after 6 stage-2 steps, T ≈ T1 * 0.85^6 ≈ T1 * 0.38
     //   stage3 = 0.99: gentle annealing, T halves every ~70 steps
     double alpha_stage1 = 1.0;
-    double alpha_stage2 = 0.85;
+    double alpha_stage2 = 0.92;
     double alpha_stage3 = 0.99;
 
     // One-shot reheating at the stage 2 → stage 3 boundary.  The original
@@ -62,14 +62,6 @@ struct SACooling {
     //   0.7 = jump T to 70% of initial T (the case-56 4.9158 setting)
     //   1.0 = jump back to full T1 (FastSA-style aggressive reheat)
     double stage3_reheat = 0.7;
-
-    // Adaptive reheating inside stage 3: when iters_since_improvement
-    // exceeds reheat_stagnation_iters * iters_per_step, kick T up to
-    // reheat_to_fraction_of_T1 * T1 (capped at T1).  Resets iters_since_
-    // improvement so we don't loop reheating on the same plateau.
-    // Set reheat_stagnation_iters = 0 to disable.
-    int    reheat_stagnation_iters    = 8;
-    double reheat_to_fraction_of_T1   = 0.3;
 
     // Lower bound for T relative to T1.  T is never set below T1*T_floor_ratio.
     // Same value as stopping.T_frozen_ratio by default (see SAStopping).
