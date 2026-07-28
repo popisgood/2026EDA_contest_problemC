@@ -23,8 +23,8 @@ inserts its own directory on sys.path and imports the other five).
 ----------------------------------------------------------------------
 2. FILES
 ----------------------------------------------------------------------
-electro_optimizer.py   Entry point (FloorplanOptimizer subclass, multi-seed
-                       driver, candidate-portfolio ranking).
+electro_optimizer.py   Entry point (FloorplanOptimizer subclass): 8-seed
+                       persistent-pool multi-start driver, candidate ranking.
 analytical_place.py    Continuous global placement (PyTorch / Adam), incl.
                        Jacobi graph-layout warm-start and MIB shape loss.
 legalize.py            Constraint-graph compaction + push-apart legalisation
@@ -41,6 +41,9 @@ shape_compact.py       SDS-style post-legalize compaction + soft reshaping,
                        compaction is reached.
 requirements.txt       Python dependencies (torch, numpy).
 README.txt             This file.
+
+Note: an ML warm-start path exists (ELECTRO_ML_INIT=1) but is OFF by default
+and its ml/ package is NOT bundled here -- see section 4.
 
 iccad2026_evaluate.py is NOT bundled -- it is provided by the contest
 environment and imported at evaluation time.
@@ -63,42 +66,71 @@ The submitted default GUARANTEES every block lands in the first quadrant
     ELECTRO_CLAMP  = 1   (in-optimization lower-wall clamp)
     ELECTRO_NONNEG = 1   (floor-aware legalize + repair chain)
 
-Candidate-portfolio defaults (all set at the top of electro_optimizer.py):
+Multi-start + candidate-portfolio defaults (all set in electro_optimizer.py):
 
+    ELECTRO_SEEDS             = 8        independent starts per case
+    ELECTRO_PARALLEL          = 1        run the 8 seeds in a PERSISTENT fork
+                                         pool (built once for the whole eval,
+                                         not once per case) -- on an 8+ core
+                                         machine this makes 8 seeds cost about
+                                         one seed's wall-clock, not 8x
+    ELECTRO_ML_INIT           = 0        ML warm-start OFF (see below)
+    ELECTRO_JACOBI_MODE       = hedge    each seed's own place() call uses
+                                         Jacobi graph-layout warm-start (the
+                                         hedge fallback track only activates
+                                         when ELECTRO_SEEDS==1 -- with 8 seeds
+                                         already independent, it would be
+                                         redundant serial work)
     ELECTRO_COMPACT           = 1        SDS-style post-legalize compaction
     ELECTRO_BOUNDARY_WIDESWAP = 1        boundary repair wide-swap variant
     ELECTRO_GROUPING_PUSHPAST = 1        grouping repair push-past variant
-    ELECTRO_JACOBI_MODE       = hedge    Jacobi warm-start (full iters) as
-                                         primary + short random-init fallback
-    ELECTRO_HEDGE_ITERS       = 300      fallback track's iteration budget
     ELECTRO_EXPAND_TOPK       = 1        only expand repair-variant cascades
                                          from the single best-ranked start
     ELECTRO_ITERS_PORTFOLIO   = off      adaptive 1200-iter extension DISABLED
                                          (measured: costs +84% runtime for
-                                         -5.8% score, and was the main source
-                                         of per-case regressions -- see below)
+                                         -5.8% score on a single-seed config,
+                                         and was the main source of per-case
+                                         regressions -- see electro_optimizer.py)
+
+ELECTRO_ML_INIT=1 restores a trained-model warm-start (ml/predict.py +
+ml/weights/floorplan_v2.pt from the dev tree, NOT bundled in this package --
+add ELECTRO_ML_DIR or copy ml/ alongside this directory to use it). It is
+off by default because it measured WORSE than Jacobi at equal seed count
+(see table below) and this package should run with zero external deps
+beyond requirements.txt.
 
 Full-100 validation-set comparison (local evaluator, RuntimeFactor=1,
-neutral RT, all configs 100/100 feasible), serial/uncontended measurement:
+neutral RT, all configs 100/100 feasible), serial/uncontended measurement,
+with compaction/wide-swap/push-past/top-K-pruning held fixed across rows:
 
-    config                        Total Score   avg runtime/case
-    this submission (hedge+topk)     1.9683         5.50 s
-    prior temp default               2.7215         3.41 s
-    prior temp + M1 warm-start       2.3757         7.17 s
+    config                              Total Score   avg runtime/case
+    this submission (8-seed Jacobi)         1.7312         4.53 s
+    8-seed ML warm-start instead             1.7741         4.68 s
+    4-seed ML + 4-seed Jacobi split          1.7783         4.54 s  (worse
+                                                than EITHER pure variant on
+                                                15/100 cases -- mixing warm-
+                                                start methods within one
+                                                ranking pool is not simply
+                                                "average of both"; rejected)
+    prior single-seed hedge+top-K            1.9683         5.50 s
+    teammate's 8-seed ML variant (no
+      compaction/wide-swap/push-past)        1.9025         3.84 s
+    prior temp default (no multi-start)      2.7215         3.41 s
+    prior temp + M1 warm-start               2.3757         7.17 s
 
-This config was picked because it is the only one tested that beat a
-teammate's independently-developed variant on BOTH score (-2.5%) AND
-runtime (-12.1%) in the same serial benchmark; ELECTRO_JACOBI_MODE=replace
-scores slightly worse (2.0368) but runs faster still (4.08 s/case) if a
-tight official RT median ends up mattering more than the extra ~4% score --
-see ELECTRO_JACOBI_MODE's docstring comment in electro_optimizer.py for the
-full trade-off and how to switch.
+8-seed Jacobi is the only config here that is simultaneously the best score
+AND has no ML weights to ship.  ELECTRO_JACOBI_MODE=replace or =portfolio,
+ELECTRO_SEEDS=1, and ELECTRO_ML_INIT=1 are all still available as overrides
+if a different point on the score/runtime/dependency trade-off is wanted --
+see the docstring comments at the top of electro_optimizer.py.
 
 All behaviour is overridable via environment variables (optional):
     ELECTRO_CLAMP=0 ELECTRO_NONNEG=0   -> allows negative coordinates.
-    ELECTRO_JACOBI_MODE=replace        -> faster, single-track (see above).
-    ELECTRO_JACOBI_MODE=portfolio      -> two full 600-iter tracks, safest.
-    ELECTRO_SEEDS=N                    -> N multi-start seeds (default 1).
+    ELECTRO_SEEDS=N ELECTRO_PARALLEL=0 -> N seeds, sequential (no fork pool).
+    ELECTRO_ML_INIT=1                  -> ML warm-start instead of Jacobi.
+    ELECTRO_JACOBI_MODE=replace        -> single Jacobi start per seed with
+                                         no random-init fallback (only
+                                         relevant when ELECTRO_SEEDS=1).
     ELECTRO_ITERS=K                    -> placement iterations (default 600).
 
 No code change is needed to run -- the defaults are production-ready.

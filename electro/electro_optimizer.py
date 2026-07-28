@@ -139,17 +139,44 @@ class MyOptimizer(FloorplanOptimizer):
         # runtime penalty (R^0.3, UNCAPPED on the slow side) usually makes seeds=1
         # win the runtime-adjusted total unless the field's median runtime is very
         # high.  Default 1 (fast); raise it when runtime is cheap / median is high.
-        self.seeds = int(os.environ.get("ELECTRO_SEEDS", "1"))
-        # Multi-start seeds in parallel fork processes.  OFF by default: on CPU
-        # the place loop is dispatch/OpenMP-bound, and forked workers oversubscribe
-        # the OpenMP runtime (N workers x M threads); the real seed-batching speedup
-        # belongs on the GPU.  ELECTRO_PARALLEL=1 to opt in.
-        self.parallel = os.environ.get("ELECTRO_PARALLEL", "0") == "1"
+        # Default 8 (2026-07-28): multi-start diversity turned out to be worth more
+        # than any single-start refinement we had.  Measured full-100: an 8-seed
+        # parallel multi-start scored 1.9025 @ 3.84s/case where our best
+        # single-start pipeline (Jacobi + hedge + repair cascade) got 1.9683 @
+        # 5.50s -- better on BOTH axes.  The cases it wins are exactly the ones a
+        # single clever init loses: tid6 1.89 vs our 2.46, tid60 1.85 vs our 2.17,
+        # i.e. the bad-basin cases the hedge fallback was built for and only
+        # partially fixed.  8 independent basins simply covers them.
+        self.seeds = int(os.environ.get("ELECTRO_SEEDS", "8"))
+        # Multi-start seeds in parallel fork processes.  ON by default now: with a
+        # PERSISTENT pool (see _get_pool) the fork happens once per evaluation
+        # rather than once per case, so N seeds cost ~1 seed of wall-clock on an
+        # N-core box.  That is what makes seeds=8 affordable at all -- the
+        # runtime penalty R^0.3 is uncapped on the slow side, so 8x sequential
+        # would have been a losing trade.  Workers are single-threaded
+        # (ELECTRO_WORKER_THREADS) since n<=120 gives intra-op parallelism nothing
+        # to chew on and N workers x M threads just oversubscribes.
+        self.parallel = os.environ.get("ELECTRO_PARALLEL", "1") == "1"
+        self._pool = None
         # ML warm-start: use the trained FloorplanTransformer's predicted block
         # centers as the analytical placer's init (instead of random).  Lazily
         # loaded; falls back to random init if weights/model are unavailable.
-        self.ml_init = os.environ.get("ELECTRO_ML_INIT", "1") == "1"
+        #
+        # DEFAULTED OFF (2026-07-28).  Full-100 with everything else in this file
+        # held fixed (8-seed persistent-pool multistart + compaction + wide-swap +
+        # grouping push-past + top-K pruning + fixed-reference ranking):
+        #     ELECTRO_ML_INIT=1 (ML):      1.7741 @ 4.68s/case
+        #     ELECTRO_ML_INIT=0 (Jacobi):  1.7312 @ 4.53s/case  <- picked default
+        #     50/50 split of the 8 seeds:  1.7783 @ 4.54s/case  (WORSE than either
+        #       pure variant on 15/100 cases -- mixing candidate types within one
+        #       ranking pool is not simply "average of both", tried and rejected)
+        # Jacobi wins on both axes AND drops the ml/predict.py + floorplan_v2.pt
+        # dependency from the submission entirely.  ELECTRO_ML_INIT=1 restores it.
+        self.ml_init = os.environ.get("ELECTRO_ML_INIT", "0") == "1"
         self._predictor = None
+        # Split multi-start knob kept for future A/B; NOT the picked default (see
+        # above -- measured worse than committing all seeds to Jacobi).
+        self.init_split = os.environ.get("ELECTRO_INIT_SPLIT", "off")
 
     def solve(
         self,
@@ -212,30 +239,46 @@ class MyOptimizer(FloorplanOptimizer):
         else:
             os.environ["ELECTRO_INIT"] = "random"
 
+        # Split multi-start: first half of seeds "ml", rest "jacobi".  With an
+        # odd nseeds the extra seed goes to jacobi (it was the slightly stronger
+        # of the two in isolation, marginally).
+        split_methods = None
+        if self.init_split == "half":
+            n_ml = nseeds // 2
+            split_methods = ["ml"] * n_ml + ["jacobi"] * (nseeds - n_ml)
+
         starts = None
         needs_extension = False
         try:
             if self.parallel and nseeds > 1 and self.device == "cpu":
                 try:
-                    electro_parallel.WORK = P
-                    nproc = min(nseeds, os.cpu_count() or 1)
-                    threads = int(os.environ.get("ELECTRO_WORKER_THREADS", "1"))
-                    ctx = mp.get_context("fork")
-                    with ctx.Pool(nproc, initializer=electro_parallel.pool_init,
-                                   initargs=(threads,)) as pool:
-                        res = pool.map(electro_parallel.seed_worker_diag, range(nseeds))
+                    # PERSISTENT pool + per-case pickling of P, rather than the old
+                    # "build a Pool inside a with-block every case" path.  Forking a
+                    # parent that holds torch is expensive; doing it 100x (once per
+                    # case) cost far more than the pickling it avoided.  P is small
+                    # here (n<=120, a few hundred edges), so shipping it to workers
+                    # each case is cheap.
+                    pool = self._get_pool(nseeds)
+                    if split_methods is not None:
+                        res = pool.starmap(electro_parallel.run_start_dispatch,
+                                           [(s, P, split_methods[s]) for s in range(nseeds)])
+                    else:
+                        res = pool.starmap(electro_parallel.run_start_diag,
+                                           [(s, P) for s in range(nseeds)])
                     starts = [r[0] for r in res]
                     needs_extension = any(r[1] for r in res)
                 except Exception as e:
                     sys.stderr.write(f"[electro] parallel failed ({e}); sequential\n")
+                    self._close_pool()
                     starts = None
-                finally:
-                    electro_parallel.WORK = None
-            
+
             if starts is None:
                 starts = []
                 for s in range(nseeds):
-                    layout, needs_ext = electro_parallel.run_start_diag(s, P)
+                    if split_methods is not None:
+                        layout, needs_ext = electro_parallel.run_start_dispatch(s, P, split_methods[s])
+                    else:
+                        layout, needs_ext = electro_parallel.run_start_diag(s, P)
                     starts.append(layout)
                     if needs_ext:
                         needs_extension = True
@@ -253,7 +296,13 @@ class MyOptimizer(FloorplanOptimizer):
             # two complete place() calls to buy that fallback; the random track only
             # needs to be good enough to win the ranking on the cases where Jacobi
             # lands badly, so it runs at a fraction of the iterations.
-            if jacobi_mode == "hedge":
+            # Only worth it for a SINGLE start.  With nseeds>1 the multi-start
+            # already supplies independent basins -- that is the same job the
+            # hedge track was doing, done better -- so paying for an extra short
+            # place() per seed on top would be redundant work, and it runs in the
+            # parent (serial) where it costs full wall-clock instead of riding the
+            # pool's parallelism.
+            if jacobi_mode == "hedge" and nseeds == 1:
                 hedge_iters = int(os.environ.get(
                     "ELECTRO_HEDGE_ITERS", str(max(1, self.iters // 2))))
                 for s in range(nseeds):
@@ -460,6 +509,38 @@ class MyOptimizer(FloorplanOptimizer):
         )
         return [(float(x[i]), float(y[i]), float(w[i]), float(h[i]))
                 for i in range(block_count)]
+
+    def _get_pool(self, nseeds):
+        """One fork pool shared by the whole evaluation, created on first use.
+
+        Deliberately lazy rather than built in __init__: fork is only safe while
+        the parent is not inside an OpenMP parallel region (libgomp's fork hazard
+        -- the child inherits a thread-pool state that never unlocks and hangs).
+        On the first solve() call the parent has only imported torch, not run any
+        tensor math, which is the safe moment; workers are pinned single-threaded
+        afterwards so no further fork is ever needed.
+        """
+        if self._pool is None:
+            nproc = max(1, min(nseeds, os.cpu_count() or 1))
+            threads = int(os.environ.get("ELECTRO_WORKER_THREADS", "1"))
+            ctx = mp.get_context("fork")
+            self._pool = ctx.Pool(nproc, initializer=electro_parallel.pool_init,
+                                  initargs=(threads,))
+        return self._pool
+
+    def _close_pool(self):
+        """Drop the pool so a failure falls back to sequential cleanly, and the
+        next case gets a fresh pool instead of repeating a wedged one."""
+        if self._pool is not None:
+            try:
+                self._pool.terminate()
+                self._pool.join()
+            except Exception:
+                pass
+            self._pool = None
+
+    def __del__(self):
+        self._close_pool()
 
     def _ml_centers(self, block_count, area_targets, constraints, target_positions,
                     b2b, p2b, pins):

@@ -140,6 +140,18 @@ def run_start_jacobi_diag(seed, P):
 
 
 
+def run_start_dispatch(seed, P, method):
+    """Per-seed warm-start choice for a split multi-start pool (2026-07-28):
+    half the seeds use P["init"] (ML-predicted centers, if computed) and half
+    use Jacobi graph-layout warm-start, so a single pool of workers samples
+    BOTH basins-of-attraction styles instead of committing the whole run to
+    one.  method == "ml" -> run_start_diag (respects P["init"]);
+    anything else -> run_start_jacobi_diag (ignores P["init"], forces Jacobi)."""
+    if method == "ml":
+        return run_start_diag(seed, P)
+    return run_start_jacobi_diag(seed, P)
+
+
 def run_start_with_iters(seed, P, iters):
     """One start with custom placement iterations."""
     P_custom = P.copy()
