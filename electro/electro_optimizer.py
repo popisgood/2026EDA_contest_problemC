@@ -36,10 +36,54 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # the lower-cost (but negative-coord) configuration.
 os.environ.setdefault("ELECTRO_CLAMP", "1")
 os.environ.setdefault("ELECTRO_NONNEG", "1")
-# SDS-style compaction + soft-shaping as a strictly-additive extra candidate
-# (kept only when the exp(2*V_rel)-aware ranking finds it net-better).  Full-100
-# 2.9660 -> 2.8414, 100/100 feasible.  ELECTRO_COMPACT=0 restores the old path.
+# Portfolios (WIDESWAP and GROUPING_PUSHPAST):
+# Both are defaulted to "1" (2026-07-16) because they are strictly additive portfolio
+# variants (only adding candidate starts evaluated by the cost proxy) and have been
+# validated to cooperatively reduce the Neutral RT score from 2.4822 to 2.4072.
+os.environ.setdefault("ELECTRO_BOUNDARY_WIDESWAP", "1")
+os.environ.setdefault("ELECTRO_GROUPING_PUSHPAST", "1")
+# Iters portfolio: DEFAULTED OFF in the merged tree.  Measured on the full 100
+# (real evaluator, neutral RT) it was the dominant runtime cost -- 3.41s -> 5.83s
+# avg -- AND the source of most of the 17/100 cases where the graph branch scored
+# WORSE than temp (tid6 +80.9%, tid47 +21.2% at 9.55s, tid60 +12.0% at 10.32s).
+# The candidate ranking is a PROXY (exp(2*V_rel)*(hpwl/mean + area/mean)), not the
+# true contest cost, so extra candidates are only "strictly additive" with respect
+# to the proxy -- feeding it more candidates can and does make it pick a layout
+# that is worse by the real cost.  Set to "adaptive" or "1" to re-enable.
+os.environ.setdefault("ELECTRO_ITERS_PORTFOLIO", "off")
+os.environ.setdefault("ELECTRO_ITERS_PORTFOLIO_VAL", "1200")
+# SDS-style compaction + soft shaping, ported from the temp branch (0c665b0,
+# 87ce991: full-100 2.966 -> 2.722 there).  Repair-only, no extra place() call.
 os.environ.setdefault("ELECTRO_COMPACT", "1")
+# Jacobi graph-layout initialization mode (2026-07-18):
+#   - "replace"   : Jacobi is the only init.  Cheapest, but no fallback when
+#                   Jacobi lands in a bad basin (measured full-100: one case
+#                   scored 4.86 vs 2.27 under random init -- see "hedge" below).
+#   - "portfolio" : Both Random and Jacobi run a FULL 600-iter start; ranking
+#                   picks the best.  Safe but pays for two complete place() calls.
+#   - "hedge"     : Jacobi runs full iters as primary; Random runs SHORT
+#                   (ELECTRO_HEDGE_ITERS) as a cheap fallback basin.  Combined
+#                   with ELECTRO_EXPAND_TOPK below, this is the merged tree's
+#                   picked default -- see the serial full-100 benchmark this was
+#                   chosen from (2026-07-28, real evaluator, neutral RT):
+#                     friend graph default:        2.0196 @ 6.26s/case
+#                     merged replace:               2.0368 @ 4.08s/case
+#                     merged hedge-300 + top-1:     1.9683 @ 5.50s/case  <- picked
+#                   hedge-300+top-1 is the only config that beat the graph
+#                   branch on BOTH score (-2.5%) and per-case runtime (-12.1%)
+#                   in that run; replace is faster still if a tighter RT median
+#                   turns out to matter more than the extra ~4% score.
+#   - "off"       : Runs Random-init only (no Jacobi).
+os.environ.setdefault("ELECTRO_JACOBI_MODE", "hedge")
+os.environ.setdefault("ELECTRO_HEDGE_ITERS", "300")
+# Top-K candidate pruning (2026-07-28): the push-past/wide-swap/compact repair
+# variants CASCADE (each re-runs on the previous stage's output), so their cost
+# grows with the number of raw starts, not with place()'s iteration count.
+# Expanding only from the best-ranked raw start is what let hedge (2 raw
+# starts) get down to portfolio-like scores without paying portfolio's full
+# cascade cost.  0 restores the old "expand every start" behaviour.
+os.environ.setdefault("ELECTRO_EXPAND_TOPK", "1")
+
 
 from iccad2026_evaluate import FloorplanOptimizer
 from legalize import verify_overlap
@@ -144,9 +188,9 @@ class MyOptimizer(FloorplanOptimizer):
             "p2b": p2b_connectivity, "pins": pins_pos, "cons": constraints,
             "tp": target_positions, "iters": self.iters, "lr": self.lr,
             "device": self.device, "init": init_centers, "is_pre": is_pre,
-            "clust_id": clust_id, "bcode": bcode, "rounds": self.repair_rounds,
+            "clust_id": clust_id, "mib_id": mib_id, "bcode": bcode, "rounds": self.repair_rounds,
             "nonneg": os.environ.get("ELECTRO_NONNEG", "0") == "1",
-            "is_soft": is_soft, "mib_id": mib_id,
+            "is_soft": is_soft,
         }
 
         # Multi-start: each seed lands in a different basin; run them in parallel
@@ -160,88 +204,248 @@ class MyOptimizer(FloorplanOptimizer):
         # The solver can't see the GT baseline, so we rank by
         # exp(2*V_rel)*(hpwl/mean + area/mean), mirroring contest cost.  CUDA can't
         # be forked, so on GPU we run seeds sequentially (fast anyway).
-        # Two-track parallelism (opt-in, ELECTRO_PARALLEL_TRACKS=1): run the
-        # random-init track and the M1 track in two forked processes (~half the
-        # cores each) so the warm-start's 2nd place() overlaps the random-init
-        # place().  Produces the IDENTICAL candidate set as the sequential path
-        # below, so the ranking and final score are unchanged -- pure speedup.
-        starts = self._parallel_tracks(P, nseeds, init_centers)
-        from_parallel = starts is not None
+        # Determine Jacobi Mode: "replace", "portfolio", or "off" (2026-07-18)
+        jacobi_mode = os.environ.get("ELECTRO_JACOBI_MODE", "replace").lower()
+        old_init = os.environ.get("ELECTRO_INIT", "random")
+        if jacobi_mode in ("replace", "hedge"):
+            os.environ["ELECTRO_INIT"] = "jacobi"
+        else:
+            os.environ["ELECTRO_INIT"] = "random"
 
-        if not from_parallel and self.parallel and nseeds > 1 and self.device == "cpu":
-            try:
-                electro_parallel.WORK = P
-                nproc = min(nseeds, os.cpu_count() or 1)
-                threads = int(os.environ.get("ELECTRO_WORKER_THREADS", "1"))
-                ctx = mp.get_context("fork")
-                with ctx.Pool(nproc, initializer=electro_parallel.pool_init,
-                              initargs=(threads,)) as pool:
-                    starts = pool.map(electro_parallel.seed_worker, range(nseeds))
-            except Exception as e:
-                sys.stderr.write(f"[electro] parallel failed ({e}); sequential\n")
-                starts = None
-            finally:
-                electro_parallel.WORK = None
-        if starts is None:
-            starts = [electro_parallel.run_start(s, P) for s in range(nseeds)]
+        starts = None
+        needs_extension = False
+        try:
+            if self.parallel and nseeds > 1 and self.device == "cpu":
+                try:
+                    electro_parallel.WORK = P
+                    nproc = min(nseeds, os.cpu_count() or 1)
+                    threads = int(os.environ.get("ELECTRO_WORKER_THREADS", "1"))
+                    ctx = mp.get_context("fork")
+                    with ctx.Pool(nproc, initializer=electro_parallel.pool_init,
+                                   initargs=(threads,)) as pool:
+                        res = pool.map(electro_parallel.seed_worker_diag, range(nseeds))
+                    starts = [r[0] for r in res]
+                    needs_extension = any(r[1] for r in res)
+                except Exception as e:
+                    sys.stderr.write(f"[electro] parallel failed ({e}); sequential\n")
+                    starts = None
+                finally:
+                    electro_parallel.WORK = None
+            
+            if starts is None:
+                starts = []
+                for s in range(nseeds):
+                    layout, needs_ext = electro_parallel.run_start_diag(s, P)
+                    starts.append(layout)
+                    if needs_ext:
+                        needs_extension = True
 
-        # SDS-style compaction + soft shaping (opt-in): add the compacted layout of
-        # each start as an EXTRA candidate.  The ranking below (which includes
-        # exp(2*V_rel)) keeps it only when it is net better -- compaction cuts
-        # area_gap but can disturb grouping/boundary, so we let the cost proxy, not a
-        # bbox-only test, decide.  Strictly additive: can never worsen the result.
-        if not from_parallel and os.environ.get("ELECTRO_COMPACT", "0") == "1":
-            # plain (max squeeze) + S1 constraint-aware (rigid clusters + boundary
-            # re-snap) -- the ranking picks the best of {none, plain, S1} per case.
-            starts = starts + [electro_parallel.compact_variant(s, P, aware=False)
-                               for s in starts] \
-                            + [electro_parallel.compact_variant(s, P, aware=True)
-                               for s in starts]
+            # Generate portfolio variants of the 600-iter starts first
+            cands_600 = []
+            cand_sources = []
+            base_source = "jacobi" if jacobi_mode in ("replace", "hedge") else "random"
+            for s in starts:
+                cands_600.append(s)
+                cand_sources.append(base_source)
 
-        # M1 constructive-imitation candidate (opt-in, ELECTRO_M1=1): one
-        # autoregressive rollout with exact legality masking -> zero-overlap
-        # layout, added as ANOTHER candidate for the same cost-aware ranking.
-        # Strictly additive; needs trained weights (ml/weights/m1_*.pt).
-        if not from_parallel and os.environ.get("ELECTRO_M1", "0") == "1":
-            m1 = self._m1_candidate(block_count, area_targets, constraints,
-                                    target_positions, b2b_connectivity,
-                                    p2b_connectivity, pins_pos)
-            if m1 is not None:
-                starts = starts + [m1]
-                if os.environ.get("ELECTRO_COMPACT", "0") == "1":
-                    # M1 has no structural boundary/grouping guarantee (diag_m1.py
-                    # showed Vrel 0.5-0.8 raw), so it needs the S1-aware repair
-                    # chain even more than the analytical starts do -- give it both
-                    # variants, same as above, and let the ranking pick.
-                    starts = starts + [
-                        electro_parallel.compact_variant(m1, P, aware=False),
-                        electro_parallel.compact_variant(m1, P, aware=True),
-                    ]
-                # M1 warm-start (independent switch so it can be A/B'd alone):
-                # seed electro's gradient optimizer from M1's legal rollout, let
-                # continuous refinement fix HPWL/V that M1's autoregressive drift
-                # leaves behind.  Its own compacted variants join the ranking too.
-                if os.environ.get("ELECTRO_M1_WARMSTART", "0") == "1":
-                    ws = electro_parallel.m1_warmstart_variant(m1, P)
-                    starts = starts + [ws]
-                    if os.environ.get("ELECTRO_COMPACT", "0") == "1":
-                        starts = starts + [
-                            electro_parallel.compact_variant(ws, P, aware=False),
-                            electro_parallel.compact_variant(ws, P, aware=True),
-                        ]
+            # "hedge": Jacobi runs at full iters as the primary track, plus a SHORT
+            # random-init track as a fallback basin.  Full "portfolio" mode pays for
+            # two complete place() calls to buy that fallback; the random track only
+            # needs to be good enough to win the ranking on the cases where Jacobi
+            # lands badly, so it runs at a fraction of the iterations.
+            if jacobi_mode == "hedge":
+                hedge_iters = int(os.environ.get(
+                    "ELECTRO_HEDGE_ITERS", str(max(1, self.iters // 2))))
+                for s in range(nseeds):
+                    c = electro_parallel.run_start_random_with_iters(s, P, hedge_iters)
+                    cands_600.append(c)
+                    cand_sources.append("random")
+
+            # Jacobi graph-layout init portfolio: add Jacobi-initialized candidates
+            # as EXTRA portfolio entries ONLY in "portfolio" mode.
+            if jacobi_mode == "portfolio":
+                # Run Jacobi starts and get their needs_extension flag
+                jacobi_starts = []
+                for s in range(nseeds):
+                    layout, needs_ext = electro_parallel.run_start_jacobi_diag(s, P)
+                    jacobi_starts.append(layout)
+                    if needs_ext:
+                        needs_extension = True
+                for s in jacobi_starts:
+                    cands_600.append(s)
+                    cand_sources.append("jacobi")
+
+            # Number of genuine independent starts, before the repair-only
+            # expansions below multiply the candidate list.
+            n_starts = len(cands_600)
+
+            # Prune before expanding.
+            #
+            # The repair variants below are the real runtime driver, not place():
+            # each one re-runs the grouping/boundary repair loop, and they CASCADE
+            # (wide-swap expands the push-past outputs too), so the work grows
+            # multiplicatively in the number of starts.  Measured: going from 1
+            # start (replace) to 2 (hedge/portfolio) cost 3.97s -> 6.8-7.2s, far
+            # more than the extra place() alone accounts for.
+            #
+            # A repair variant grown from a start that already loses the ranking
+            # essentially never becomes the overall winner, so rank the raw starts
+            # first and expand only the best.  ELECTRO_EXPAND_TOPK=0 expands from
+            # every start (the old behaviour).
+            topk = int(os.environ.get("ELECTRO_EXPAND_TOPK", "1"))
+
+            def _proxy_of(c):
+                x, y, w, h = c
+                vb, vg, vm, nsoft = soft_violation_counts(x, y, w, h, bcode,
+                                                          clust_id, mib_id)
+                hp = _hpwl(x + 0.5 * w, y + 0.5 * h, eb, ep, pv)
+                ar = (float((x + w).max() - x.min())
+                      * float((y + h).max() - y.min()))
+                return np.exp(2.0 * (vb + vg + vm) / nsoft), hp, ar
+
+            if 0 < topk < n_starts:
+                sc = [_proxy_of(c) for c in cands_600[:n_starts]]
+                rh0 = sc[0][1] or 1.0
+                ra0 = sc[0][2] or 1.0
+                order = sorted(range(n_starts),
+                               key=lambda i: sc[i][0] * (sc[i][1] / rh0
+                                                         + sc[i][2] / ra0))
+                expand_idx = order[:topk]
+            else:
+                expand_idx = list(range(n_starts))
+
+            # Working pool the cascade expands from -- the pruned starts only.
+            # Losing starts stay in cands_600 as candidates, they just don't seed
+            # further variants.
+            pool = [cands_600[i] for i in expand_idx]
+            pool_src = [cand_sources[i] for i in expand_idx]
+
+            def _add(c, src):
+                cands_600.append(c)
+                cand_sources.append(src)
+                pool.append(c)
+                pool_src.append(src)
+
+            if os.environ.get("ELECTRO_BOUNDARY_PUSHPAST", "0") == "1":
+                for c, s in list(zip(pool, pool_src)):
+                    _add(electro_parallel.boundary_pushpast_variant(c, P), s)
+            if os.environ.get("ELECTRO_GROUPING_PUSHPAST", "0") == "1":
+                has_vg = False
+                for (x, y, w, h) in pool:
+                    _, vg, _, _ = soft_violation_counts(x, y, w, h, bcode,
+                                                        clust_id, mib_id)
+                    if vg > 0:
+                        has_vg = True
+                        break
+                if has_vg:
+                    for c, s in list(zip(pool, pool_src)):
+                        _add(electro_parallel.grouping_pushpast_variant(c, P), s)
+            if os.environ.get("ELECTRO_BOUNDARY_WIDESWAP", "0") == "1":
+                for c, s in list(zip(pool, pool_src)):
+                    _add(electro_parallel.boundary_wideswap_variant(c, P), s)
+            # SDS-style compaction (ported from temp branch): applied to the pruned
+            # STARTS only, not to the push-past/wide-swap expansions.
+            if os.environ.get("ELECTRO_COMPACT", "0") == "1":
+                for i in expand_idx:
+                    for aware in (False, True):
+                        c = electro_parallel.compact_variant(cands_600[i], P,
+                                                             aware=aware)
+                        cands_600.append(c)
+                        cand_sources.append(cand_sources[i])
+
+            # Evaluate the 600-iter candidates to determine best_600_score and best_source
+            cands_eval_600 = []
+            for i, (x, y, w, h) in enumerate(cands_600):
+                vb, vg, vm, nsoft = soft_violation_counts(x, y, w, h, bcode, clust_id, mib_id)
+                vrel = (vb + vg + vm) / nsoft
+                hpwl = _hpwl(x + 0.5 * w, y + 0.5 * h, eb, ep, pv)
+                area = (float((x + w).max() - x.min()) * float((y + h).max() - y.min()))
+                cands_eval_600.append((x, y, w, h, vrel, hpwl, area, cand_sources[i]))
+
+            mh_600 = np.mean([c[5] for c in cands_eval_600]) or 1.0
+            ma_600 = np.mean([c[6] for c in cands_eval_600]) or 1.0
+            best_idx = min(range(len(cands_eval_600)), key=lambda i: np.exp(2.0 * cands_eval_600[i][4]) * (cands_eval_600[i][5] / mh_600 + cands_eval_600[i][6] / ma_600))
+            best_600 = cands_eval_600[best_idx]
+            best_600_score = np.exp(2.0 * best_600[4]) * (best_600[5] / mh_600 + best_600[6] / ma_600)
+            best_source = best_600[7]
+
+            # Decide whether to run iters=1200
+            portfolio_mode = os.environ.get("ELECTRO_ITERS_PORTFOLIO", "adaptive")
+            best_score_thresh = float(os.environ.get("ELECTRO_ADAPTIVE_SCORE_THRESH", "2.0"))
+            
+            run_iters_portfolio = False
+            if portfolio_mode == "1":
+                run_iters_portfolio = True
+            elif portfolio_mode == "adaptive":
+                run_iters_portfolio = needs_extension and (best_600_score >= best_score_thresh)
+
+            # Final candidates list starts with the 600-iter candidates
+            final_starts = list(cands_600)
+
+            if run_iters_portfolio:
+                custom_iters = int(os.environ.get("ELECTRO_ITERS_PORTFOLIO_VAL", "1200"))
+                
+                # Run 1200-iter ONLY for the winning source!
+                starts_1200 = []
+                if best_source == "random":
+                    starts_1200 = [electro_parallel.run_start_with_iters(s, P, custom_iters) for s in range(nseeds)]
+                else: # best_source == "jacobi"
+                    starts_1200 = [electro_parallel.run_start_jacobi_with_iters(s, P, custom_iters) for s in range(nseeds)]
+
+                # Generate portfolio variants of the 1200-iter starts
+                cands_1200 = list(starts_1200)
+                if os.environ.get("ELECTRO_BOUNDARY_PUSHPAST", "0") == "1":
+                    cands_1200 = cands_1200 + [electro_parallel.boundary_pushpast_variant(s, P) for s in starts_1200]
+                if os.environ.get("ELECTRO_GROUPING_PUSHPAST", "0") == "1":
+                    has_vg = False
+                    for (x, y, w, h) in cands_1200:
+                        _, vg, _, _ = soft_violation_counts(x, y, w, h, bcode, clust_id, mib_id)
+                        if vg > 0:
+                            has_vg = True
+                            break
+                    if has_vg:
+                        cands_1200 = cands_1200 + [electro_parallel.grouping_pushpast_variant(s, P) for s in cands_1200]
+                if os.environ.get("ELECTRO_BOUNDARY_WIDESWAP", "0") == "1":
+                    cands_1200 = cands_1200 + [electro_parallel.boundary_wideswap_variant(s, P) for s in cands_1200]
+                    
+                final_starts = final_starts + cands_1200
+        finally:
+            os.environ["ELECTRO_INIT"] = old_init
+
 
         cands = []
-        for (x, y, w, h) in starts:
+        for (x, y, w, h) in final_starts:
             vb, vg, vm, nsoft = soft_violation_counts(x, y, w, h, bcode, clust_id, mib_id)
             vrel = (vb + vg + vm) / nsoft
             hpwl = _hpwl(x + 0.5 * w, y + 0.5 * h, eb, ep, pv)
             area = (float((x + w).max() - x.min()) * float((y + h).max() - y.min()))
             cands.append((x, y, w, h, vrel, hpwl, area))
 
-        mh = np.mean([c[5] for c in cands]) or 1.0
-        ma = np.mean([c[6] for c in cands]) or 1.0
+        # Candidate ranking reference.
+        #
+        # The original normalisers were the MEAN hpwl/area over the candidate set,
+        # which makes the ranking function itself depend on which candidates are
+        # present: adding one candidate rescales the hpwl-vs-area trade-off for
+        # every other candidate and can flip the winner among the pre-existing
+        # ones.  That silently breaks the "strictly additive portfolio" contract
+        # every variant in this file relies on -- a portfolio can only ever be
+        # additive with respect to a FIXED ranking function.  Measured cost of the
+        # bug on the full 100: enabling more portfolios moved 17 cases the WRONG
+        # way (tid6 +80.9%, tid54 +52.2%, tid23 +36.1%).
+        #
+        # Fix: normalise by the FIRST candidate (the plain start, always present
+        # and independent of what else got appended).  Same functional form, but
+        # the reference no longer moves, so min() over a superset is genuinely
+        # no worse than over a subset.  ELECTRO_RANK_REF=mean restores the old
+        # behaviour for A/B.
+        if os.environ.get("ELECTRO_RANK_REF", "fixed") == "mean":
+            rh = np.mean([c[5] for c in cands]) or 1.0
+            ra = np.mean([c[6] for c in cands]) or 1.0
+        else:
+            rh = cands[0][5] or 1.0
+            ra = cands[0][6] or 1.0
         x, y, w, h, vrel, hpwl, area = min(
-            cands, key=lambda c: np.exp(2.0 * c[4]) * (c[5] / mh + c[6] / ma))
+            cands, key=lambda c: np.exp(2.0 * c[4]) * (c[5] / rh + c[6] / ra))
 
         ov = verify_overlap(x, y, w, h)
         soft = ((cons[:, 0] == 0) & (cons[:, 1] == 0))
@@ -256,112 +460,6 @@ class MyOptimizer(FloorplanOptimizer):
         )
         return [(float(x[i]), float(y[i]), float(w[i]), float(h[i]))
                 for i in range(block_count)]
-
-    def _m1_weights_and_dir(self):
-        """Resolve (ml_dir, m1_weights_path) and put ml_dir on sys.path.  Pure path
-        resolution -- touches no torch -- so it is safe to call in the parent right
-        before forking the parallel tracks."""
-        here = os.path.dirname(os.path.abspath(__file__))
-        ml_dir = None
-        for d in (os.environ.get("ELECTRO_ML_DIR"), here, os.path.dirname(here)):
-            if d and os.path.isdir(os.path.join(d, "ml")):
-                ml_dir = d
-                break
-        if ml_dir is None:
-            return None, None
-        if ml_dir not in sys.path:
-            sys.path.insert(0, ml_dir)
-        weights = os.environ.get(
-            "ELECTRO_M1_WEIGHTS", os.path.join(ml_dir, "ml", "weights", "m1_v1.pt"))
-        return ml_dir, weights
-
-    def _parallel_tracks(self, P, nseeds, init_centers):
-        """Run Track A (random-init place) and Track B (M1 rollout + warm-start) in
-        two forked processes with ~half the cores each, hiding the warm-start's extra
-        place() behind the random-init place().  Returns the merged candidate list
-        (SAME set as sequential -> identical ranking/score) or None to fall back.
-
-        Gated to keep the parent OpenMP-clean before the fork (libgomp fork hazard):
-        opt-in flag, cpu only, no ML-init in the parent, and M1 enabled."""
-        if (os.environ.get("ELECTRO_PARALLEL_TRACKS", "0") != "1"
-                or self.device != "cpu" or init_centers is not None
-                or os.environ.get("ELECTRO_M1", "0") != "1"):
-            return None
-        _, weights = self._m1_weights_and_dir()
-        if weights is None:
-            return None
-        try:
-            Pw = dict(P)
-            Pw["nseeds"] = nseeds
-            pool = self._get_track_pool()
-            ra = pool.apply_async(electro_parallel.track_random, (Pw,))
-            rb = pool.apply_async(electro_parallel.track_m1, (Pw, weights))
-            cand = ra.get(timeout=300) + rb.get(timeout=300)
-            return cand or None
-        except Exception as e:
-            sys.stderr.write(f"[electro] parallel tracks failed ({e}); sequential\n")
-            # Pool may be wedged (e.g. a worker died) -- drop it so the NEXT case
-            # gets a fresh pool instead of repeating the same failure all run.
-            self._track_pool = None
-            return None
-
-    def _get_track_pool(self):
-        """Lazily create ONE persistent 2-worker spawn Pool, reused for every case
-        in this evaluation run.  SPAWN (not fork): the harness imports torch before
-        solve() is ever called, so a forked worker inherits a locked libgomp mutex
-        and deadlocks (confirmed empirically) -- spawn starts clean interpreters.
-        Persistent (not per-case) because spawn's interpreter-startup + model-load
-        cost is real (~seconds); paying it once for the whole run, not once per
-        case, is what makes this a net win instead of a net loss."""
-        if getattr(self, "_track_pool", None) is not None:
-            return self._track_pool
-        threads = int(os.environ.get(
-            "ELECTRO_TRACK_THREADS", str(max(1, (os.cpu_count() or 2) // 2))))
-        ctx = mp.get_context("spawn")
-        self._track_pool = ctx.Pool(2, initializer=electro_parallel.pool_init,
-                                    initargs=(threads,))
-        return self._track_pool
-
-    def _m1_candidate(self, block_count, area_targets, constraints,
-                      target_positions, b2b, p2b, pins):
-        """One M1 rollout as (x, y, w, h) numpy arrays, or None on any failure
-        (missing weights / dead-end): the strictly-additive fallback contract."""
-        if getattr(self, "_m1", None) is None:
-            try:
-                here = os.path.dirname(os.path.abspath(__file__))
-                ml_dir = None
-                for d in (os.environ.get("ELECTRO_ML_DIR"), here,
-                          os.path.dirname(here)):
-                    if d and os.path.isdir(os.path.join(d, "ml")):
-                        ml_dir = d
-                        break
-                if ml_dir is None:
-                    raise FileNotFoundError("ml/ package not found")
-                if ml_dir not in sys.path:
-                    sys.path.insert(0, ml_dir)
-                from ml.m1_infer import M1Predictor
-                wts = os.environ.get(
-                    "ELECTRO_M1_WEIGHTS",
-                    os.path.join(ml_dir, "ml", "weights", "m1_v1.pt"))
-                self._m1 = M1Predictor(wts, device="cpu")
-            except Exception as e:
-                sys.stderr.write(f"[electro] M1 unavailable: {e}\n")
-                self._m1 = False
-        if not self._m1 or not self._m1.available():
-            return None
-        try:
-            pos = self._m1.predict(block_count, area_targets, constraints,
-                                   target_positions, b2b, p2b, pins)
-            if pos is None:
-                return None
-            x = np.array([p[0] for p in pos])
-            y = np.array([p[1] for p in pos])
-            w = np.array([p[2] for p in pos])
-            h = np.array([p[3] for p in pos])
-            return x, y, w, h
-        except Exception as e:
-            sys.stderr.write(f"[electro] M1 predict failed: {e}\n")
-            return None
 
     def _ml_centers(self, block_count, area_targets, constraints, target_positions,
                     b2b, p2b, pins):

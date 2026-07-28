@@ -35,6 +35,8 @@ from __future__ import annotations
 import numpy as np
 
 _EPS = 1e-6
+_PUSH_GAP = 1e-4
+
 
 
 def _overlap_matrix(x, y, w, h):
@@ -114,9 +116,9 @@ def _cleanup(x, y, w, h, is_pre, max_iter, floor=None):
             if oxk <= 0 or oyk <= 0:
                 continue  # already cleared by an earlier push this pass
             if oxk <= oyk:
-                _push(x, i, j, oxk + _EPS, w, is_pre, floor)
+                _push(x, i, j, oxk + _PUSH_GAP, w, is_pre, floor)
             else:
-                _push(y, i, j, oyk + _EPS, h, is_pre, floor)
+                _push(y, i, j, oyk + _PUSH_GAP, h, is_pre, floor)
 
     # Last resort: evict whatever still overlaps to empty space above the layout
     # (stacked so evicted blocks can't overlap each other or anything below).
@@ -212,3 +214,64 @@ def verify_overlap(x, y, w, h):
     ox = np.clip(ox[iu], 0, None)
     oy = np.clip(oy[iu], 0, None)
     return float((ox * oy).sum())
+
+
+def legalize_qinfer(x, y, w, h, is_pre, floor=None, max_iter=200):
+    """Continuous differentiable overlap minimization using Adam in PyTorch.
+    Complemented by _cleanup to guarantee exact overlap removal down to 1e-6."""
+    import torch
+    x = np.asarray(x, dtype=float).copy()
+    y = np.asarray(y, dtype=float).copy()
+    w = np.asarray(w, dtype=float)
+    h = np.asarray(h, dtype=float)
+    is_pre = np.asarray(is_pre, dtype=bool)
+    
+    N = len(x)
+    if N <= 1:
+        if floor is not None and N == 1 and not is_pre[0]:
+            x[0] = max(x[0], floor); y[0] = max(y[0], floor)
+        return x, y
+        
+    dev = torch.device("cpu")
+    tx = torch.tensor(x, dtype=torch.float32, device=dev)
+    ty = torch.tensor(y, dtype=torch.float32, device=dev)
+    tw = torch.tensor(w, dtype=torch.float32, device=dev)
+    th = torch.tensor(h, dtype=torch.float32, device=dev)
+    tpinned = torch.tensor(is_pre, dtype=torch.bool, device=dev)
+    
+    # We only optimize the coordinates of movable blocks
+    t_mov_x = tx.clone().detach().requires_grad_(True)
+    t_mov_y = ty.clone().detach().requires_grad_(True)
+    
+    opt = torch.optim.Adam([t_mov_x, t_mov_y], lr=0.1)
+    
+    for _ in range(max_iter):
+        opt.zero_grad()
+        cx_curr = torch.where(tpinned, tx, t_mov_x) + 0.5 * tw
+        cy_curr = torch.where(tpinned, ty, t_mov_y) + 0.5 * th
+        
+        # Pairwise overlaps
+        ox = 0.5 * (tw[:, None] + tw[None, :]) - torch.abs(cx_curr[:, None] - cx_curr[None, :])
+        oy = 0.5 * (th[:, None] + th[None, :]) - torch.abs(cy_curr[:, None] - cy_curr[None, :])
+        
+        # Squared overlap area penalty
+        loss = (torch.relu(ox) * torch.relu(oy)).pow(2).sum()
+        
+        # Boundary constraints
+        if floor is not None:
+            px_corner = torch.where(tpinned, tx, t_mov_x)
+            py_corner = torch.where(tpinned, ty, t_mov_y)
+            loss = loss + torch.relu(floor - px_corner).pow(2).sum() + torch.relu(floor - py_corner).pow(2).sum()
+            
+        if loss.item() < 1e-6:
+            break
+            
+        loss.backward()
+        opt.step()
+        
+    with torch.no_grad():
+        final_x = torch.where(tpinned, tx, t_mov_x).numpy().astype(float)
+        final_y = torch.where(tpinned, ty, t_mov_y).numpy().astype(float)
+        
+    return _cleanup(final_x, final_y, w, h, is_pre, max_iter=4000, floor=floor)
+

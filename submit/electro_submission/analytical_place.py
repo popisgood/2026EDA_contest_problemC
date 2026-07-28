@@ -24,6 +24,7 @@ Hard constraints handled by construction:
 """
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -118,6 +119,23 @@ def place(
     # ~0.965; aim a touch higher so the achieved util (always a bit below target,
     # since blocks never perfectly tile) lands near GT and area_gap ~ 0.
     ed_util = float(os.environ.get("ELECTRO_EDENSITY_UTIL", "0.98"))
+    
+    # Custom optimizations for V_mib and V_boundary
+    # ELECTRO_MIB_SHAPE (2026-07-17): re-swept given everything stacked on top
+    # since this was first tuned. The end-of-run exact copy (`la.data.copy_`,
+    # below) guarantees V_mib=0 regardless of this weight -- it only shapes how
+    # much freedom the optimizer has DURING placement before being snapped.
+    # Sharp, reproducible, non-monotonic optimum found at 0.05 (weaker guidance
+    # than the original 0.1): full-100 Neutral RT (portfolio off, so zero extra
+    # runtime) 2.2281 -> 2.1731 (-2.5%); stacks cleanly with ELECTRO_GRP_WEIGHT
+    # and ELECTRO_ITERS_PORTFOLIO (combined: 2.1014 -> 2.0559).
+    # For Jacobi warm-start, the optimal parameters are slightly shifted compared to Random init.
+    # Default to 0.03 for Jacobi, 0.05 for Random.
+    default_mib_shape = "0.03" if os.environ.get("ELECTRO_INIT", "random") == "jacobi" else "0.05"
+    lam_mib_shape = float(os.environ.get("ELECTRO_MIB_SHAPE", default_mib_shape))
+    boundary_l2 = os.environ.get("ELECTRO_BOUNDARY_L2", "0") == "1"
+    grouping_l2 = os.environ.get("ELECTRO_GROUPING_L2", "0") == "1"
+
 
     a = area_targets[:N].float().to(dev).clamp(min=1e-9)
     cons = constraints[:N].to(dev)
@@ -173,30 +191,7 @@ def place(
     Tb = (bcode & 4) > 0
     Bb = (bcode & 8) > 0
 
-    # ---- parameters ----
-    gen = torch.Generator(device=dev).manual_seed(seed)
-    if init_centers is not None:
-        # ML warm-start: use the Transformer's predicted (cx, cy) -- given in raw
-        # coords, so normalise by S -- as the gradient-descent starting point.
-        # seed 0 = the pure prediction; further seeds jitter it for multi-start
-        # diversity while staying in the good basin the model points to.
-        ic = init_centers.to(dev).float()
-        cx = ic[:, 0] / S
-        cy = ic[:, 1] / S
-        if seed != 0:
-            j = float(os.environ.get("ELECTRO_ML_JITTER", "0.15"))
-            cx = cx + j * torch.randn(N, generator=gen, device=dev)
-            cy = cy + j * torch.randn(N, generator=gen, device=dev)
-    else:
-        cx = torch.rand(N, generator=gen, device=dev)
-        cy = torch.rand(N, generator=gen, device=dev)
-    cx = torch.where(is_pre, pre_cx, cx).clone().requires_grad_(True)
-    cy = torch.where(is_pre, pre_cy, cy).clone().requires_grad_(True)
-    la = torch.zeros(K, device=dev, requires_grad=True)   # one log-aspect per shape-group
-
-    AR_CAP = 4.0
-    la_cap = float(torch.log(torch.tensor(AR_CAP)))
-
+    # ---- edge extraction (moved before init so Jacobi warm-start can use it) ----
     eb = _valid(b2b_connectivity)
     ep = _valid(p2b_connectivity)
     pv = None
@@ -214,6 +209,85 @@ def place(
     else:
         ep = None
     total_w = 1.0 + (float(wb.sum()) if eb is not None else 0.0) + (float(wp.sum()) if ep is not None else 0.0)
+
+    # ---- parameters ----
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    if init_centers is not None:
+        # ML warm-start: use the Transformer's predicted (cx, cy) -- given in raw
+        # coords, so normalise by S -- as the gradient-descent starting point.
+        # seed 0 = the pure prediction; further seeds jitter it for multi-start
+        # diversity while staying in the good basin the model points to.
+        ic = init_centers.to(dev).float()
+        cx = ic[:, 0] / S
+        cy = ic[:, 1] / S
+        if seed != 0:
+            j = float(os.environ.get("ELECTRO_ML_JITTER", "0.15"))
+            cx = cx + j * torch.randn(N, generator=gen, device=dev)
+            cy = cy + j * torch.randn(N, generator=gen, device=dev)
+    else:
+        cx = torch.rand(N, generator=gen, device=dev)
+        cy = torch.rand(N, generator=gen, device=dev)
+
+    # ---- Jacobi warm-start: graph-layout initialization (2026-07-18) ----
+    # When ELECTRO_INIT=jacobi, refine the random (cx,cy) with K rounds of
+    # neighbor-averaging on the b2b connectivity graph.  Preplaced blocks act
+    # as fixed anchors.  This gives connected blocks a head start near each
+    # other, reducing the variance that multi-start (seeds>1) compensates for.
+    # Zero extra runtime (same iters=600, same single seed).
+    jacobi_init = os.environ.get("ELECTRO_INIT", "random")
+    jacobi_rounds = int(os.environ.get("ELECTRO_JACOBI_ROUNDS", "20"))
+    jacobi_alpha = float(os.environ.get("ELECTRO_JACOBI_ALPHA", "0.3"))
+
+    if jacobi_init == "jacobi" and eb is not None and init_centers is None:
+        with torch.no_grad():
+            cx = torch.where(is_pre, pre_cx, cx)
+            cy = torch.where(is_pre, pre_cy, cy)
+            for _ in range(jacobi_rounds):
+                # Weighted sum of neighbor positions via scatter-add
+                sum_x = torch.zeros(N, device=dev)
+                sum_y = torch.zeros(N, device=dev)
+                sum_w = torch.zeros(N, device=dev)
+                sum_x.index_add_(0, ia, wb * cx[ib])
+                sum_x.index_add_(0, ib, wb * cx[ia])
+                sum_y.index_add_(0, ia, wb * cy[ib])
+                sum_y.index_add_(0, ib, wb * cy[ia])
+                sum_w.index_add_(0, ia, wb)
+                sum_w.index_add_(0, ib, wb)
+                # Add pin/terminal pull if available
+                if ep is not None:
+                    sum_x.index_add_(0, ebk, wp * tx)
+                    sum_y.index_add_(0, ebk, wp * ty)
+                    sum_w.index_add_(0, ebk, wp)
+                # Blocks with neighbors: blend toward weighted average
+                has_nbr = sum_w > 0
+                avg_x = sum_x / sum_w.clamp(min=1e-9)
+                avg_y = sum_y / sum_w.clamp(min=1e-9)
+                new_cx = torch.where(has_nbr, (1 - jacobi_alpha) * cx + jacobi_alpha * avg_x, cx)
+                new_cy = torch.where(has_nbr, (1 - jacobi_alpha) * cy + jacobi_alpha * avg_y, cy)
+                # Preplaced blocks: always anchored at their fixed positions
+                cx = torch.where(is_pre, pre_cx, new_cx)
+                cy = torch.where(is_pre, pre_cy, new_cy)
+
+    cx = torch.where(is_pre, pre_cx, cx).clone().requires_grad_(True)
+    cy = torch.where(is_pre, pre_cy, cy).clone().requires_grad_(True)
+    la = torch.zeros(K, device=dev, requires_grad=True)   # one log-aspect per shape-group
+
+    AR_CAP = 4.0
+    la_cap = float(torch.log(torch.tensor(AR_CAP)))
+
+    # Precompute target log aspect ratio for MIB groups with anchor blocks
+    la_target = torch.zeros(K, device=dev)
+    has_anchor = torch.zeros(K, dtype=torch.bool, device=dev)
+    for k in range(K):
+        mems = (inv == k).nonzero().flatten()
+        anchors = mems[is_fixed[mems] | is_pre[mems]]
+        if anchors.numel() > 0:
+            idx = anchors[0]
+            la_target[k] = torch.clamp(
+                torch.log(tw[idx].clamp(min=1e-6) / th[idx].clamp(min=1e-6)),
+                -la_cap, la_cap
+            )
+            has_anchor[k] = True
 
     triu = torch.triu_indices(N, N, offset=1, device=dev)
     ti, tj = triu[0], triu[1]
@@ -282,6 +356,15 @@ def place(
         opt = torch.optim.SGD([cx, cy, la], lr=lr, momentum=0.9, nesterov=True)
     else:
         opt = torch.optim.Adam([cx, cy, la], lr=lr)
+
+    loss_history = []
+    
+    # elfPlace rollback + entropy injection (2026-07-18)
+    enable_rollback = os.environ.get("ELECTRO_ROLLBACK", "0") == "1"
+    rollback_count = 0
+    last_checkpoint = None
+    ov_history = []
+    opt_lbfgs = None
 
     for it in range(iters):
         opt.zero_grad()
@@ -366,21 +449,40 @@ def place(
         if Gc > 0:
             gcx = Mc @ ecx
             gcy = Mc @ ecy
-            grp = (((ecx[has_clust] - gcx[gi]).abs()
-                    + (ecy[has_clust] - gcy[gi]).abs()).sum()) / n_clust_mem
+            if grouping_l2:
+                grp = (((ecx[has_clust] - gcx[gi]).pow(2)
+                        + (ecy[has_clust] - gcy[gi]).pow(2)).sum()) / n_clust_mem
+            else:
+                grp = (((ecx[has_clust] - gcx[gi]).abs()
+                        + (ecy[has_clust] - gcy[gi]).abs()).sum()) / n_clust_mem
 
         bnd = ecx.new_zeros(())
         xmn, xmx = left.detach(), right.detach()
         ymn, ymx = bot.detach(), top.detach()
-        if Lb.any():
-            bnd = bnd + ((ecx[Lb] - 0.5 * w[Lb]) - xmn).abs().sum()
-        if Rb.any():
-            bnd = bnd + ((ecx[Rb] + 0.5 * w[Rb]) - xmx).abs().sum()
-        if Tb.any():
-            bnd = bnd + ((ecy[Tb] + 0.5 * h[Tb]) - ymx).abs().sum()
-        if Bb.any():
-            bnd = bnd + ((ecy[Bb] - 0.5 * h[Bb]) - ymn).abs().sum()
+            
+        if boundary_l2:
+            if Lb.any():
+                bnd = bnd + ((ecx[Lb] - 0.5 * w[Lb]) - xmn).pow(2).sum()
+            if Rb.any():
+                bnd = bnd + ((ecx[Rb] + 0.5 * w[Rb]) - xmx).pow(2).sum()
+            if Tb.any():
+                bnd = bnd + ((ecy[Tb] + 0.5 * h[Tb]) - ymx).pow(2).sum()
+            if Bb.any():
+                bnd = bnd + ((ecy[Bb] - 0.5 * h[Bb]) - ymn).pow(2).sum()
+        else:
+            if Lb.any():
+                bnd = bnd + ((ecx[Lb] - 0.5 * w[Lb]) - xmn).abs().sum()
+            if Rb.any():
+                bnd = bnd + ((ecx[Rb] + 0.5 * w[Rb]) - xmx).abs().sum()
+            if Tb.any():
+                bnd = bnd + ((ecy[Tb] + 0.5 * h[Tb]) - ymx).abs().sum()
+            if Bb.any():
+                bnd = bnd + ((ecy[Bb] - 0.5 * h[Bb]) - ymn).abs().sum()
         bnd = bnd / N
+
+        mib_shape = ecx.new_zeros(())
+        if has_anchor.any():
+            mib_shape = ((la - la_target) ** 2)[has_anchor].sum()
 
         # Keep the layout TIGHT: the legalizer cleans up small residual overlap,
         # so we don't ramp the spreading force so high that blocks over-disperse
@@ -388,18 +490,182 @@ def place(
         # little overlap for the legalizer and keeps wirelength/area low.
         lam_ov = ov0 + (ov1 - ov0) * frac
         lam_bb = bb0 + (bb1 - bb0) * frac
-        lam_grp = 0.2 + 1.6 * frac
-        lam_bnd = 0.2 + 1.6 * frac
+        # ELECTRO_GRP_WEIGHT (2026-07-17): the grouping-centroid pull (below) was a
+        # hardcoded constant with no external knob, unlike lam_bnd.  Sweeping it
+        # (portfolio off, so this is a zero-extra-runtime change) found a sharp,
+        # reproducible, NON-monotonic optimum at 0.4 -- weaker than the original
+        # implicit 1.0.  Counter-intuitively the original strength over-pulled
+        # cluster members toward one point, distorting HPWL/area more than it
+        # saved on V_grouping; full-100 Neutral RT Total Score 2.4071 -> 2.2281
+        # (-7.4%), stacks additively with ELECTRO_ITERS_PORTFOLIO (-> 2.1014).
+        # Do NOT also crank ELECTRO_BND_WEIGHT up when this is <1.0: the two
+        # losses compete for the same gradient budget -- combining each knob's
+        # own individual optimum (grp=0.4, bnd=2.0) regressed to 2.3060, worse
+        # than either alone. Needs a real joint grid search, not naive stacking.
+        # Default to 0.5 for Jacobi init, 0.4 for Random init.
+        default_grp_weight = "0.5" if os.environ.get("ELECTRO_INIT", "random") == "jacobi" else "0.4"
+        grp_weight = float(os.environ.get("ELECTRO_GRP_WEIGHT", default_grp_weight))
+        lam_grp = (0.2 + 1.6 * frac) * grp_weight
+        bnd_weight = float(os.environ.get("ELECTRO_BND_WEIGHT", "1.0"))
+        lam_bnd = (0.2 + 1.6 * frac) * bnd_weight
+
 
         loss = wl + lam_ov * ov + lam_bb * bbox + lam_grp * grp + lam_bnd * bnd + lam_out * out
+        if lam_mib_shape > 0.0:
+            loss = loss + (lam_mib_shape * (0.2 + 1.6 * frac)) * mib_shape
         if edensity > 0.0:
             loss = loss + edensity * den
         if lam_wall > 0.0:        # ramp the wall up so it firmly confines by the end
             loss = loss + (lam_wall * frac) * wall
         if lam_wall_lin > 0.0:    # constant (not ramped): strong from iter 0 so
             loss = loss + lam_wall_lin * wall_lin   # blocks never escape negative
+        loss_history.append(float(loss.item()))
         loss.backward()
-        opt.step()
+        
+        enable_lbfgs = os.environ.get("ELECTRO_LBFGS_FINISH", "0") == "1"
+        if enable_lbfgs and it >= iters - 50:
+            if opt_lbfgs is None:
+                opt_lbfgs = torch.optim.LBFGS([cx, cy, la], lr=0.05, max_iter=5, history_size=5, line_search_fn="strong_wolfe")
+            
+            def evaluate_loss_closure():
+                opt_lbfgs.zero_grad()
+                w_curr, h_curr = shapes(la, area_scale)
+                ecx_curr = torch.where(is_pre, pre_cx, cx)
+                ecy_curr = torch.where(is_pre, pre_cy, cy)
+                
+                wl_curr = ecx_curr.new_zeros(())
+                if eb is not None:
+                    wl_curr = wl_curr + (wb * (_sabs(ecx_curr[ia] - ecx_curr[ib], g_wl) + _sabs(ecy_curr[ia] - ecy_curr[ib], g_wl))).sum()
+                if ep is not None:
+                    wl_curr = wl_curr + ext_wl * (wp * (_sabs(tx - ecx_curr[ebk], g_wl) + _sabs(ty - ecy_curr[ebk], g_wl))).sum()
+                wl_curr = wl_curr / total_w
+                
+                dx = (ecx_curr[ti] - ecx_curr[tj]).abs()
+                dy = (ecy_curr[ti] - ecy_curr[tj]).abs()
+                ov_curr = (torch.relu(0.5 * (w_curr[ti] + w_curr[tj]) - dx) * torch.relu(0.5 * (h_curr[ti] + h_curr[tj]) - dy)).sum()
+                
+                left_c = (ecx_curr - 0.5 * w_curr).min(); right_c = (ecx_curr + 0.5 * w_curr).max()
+                bot_c = (ecy_curr - 0.5 * h_curr).min(); top_c = (ecy_curr + 0.5 * h_curr).max()
+                bbox_curr = (right_c - left_c) * (top_c - bot_c)
+                
+                out_curr = ecx_curr.new_zeros(())
+                if lam_out > 0.0 and edensity <= 0.0:
+                    hL = 0.5 / (target_util ** 0.5)
+                    gx = ((left_c + right_c) * 0.5).detach()
+                    gy = ((bot_c + top_c) * 0.5).detach()
+                    ex = (torch.relu((ecx_curr + 0.5 * w_curr) - (gx + hL))
+                          + torch.relu((gx - hL) - (ecx_curr - 0.5 * w_curr)))
+                    ey = (torch.relu((ecy_curr + 0.5 * h_curr) - (gy + hL))
+                          + torch.relu((gy - hL) - (ecy_curr - 0.5 * h_curr)))
+                    out_curr = (ex + ey).sum() / N
+                    
+                den_curr = ecx_curr.new_zeros(())
+                if edensity > 0.0:
+                    bl = ecx_curr - 0.5 * w_curr
+                    br = ecx_curr + 0.5 * w_curr
+                    bb = ecy_curr - 0.5 * h_curr
+                    bt = ecy_curr + 0.5 * h_curr
+                    ox_c = (torch.minimum(br[:, None], xR[None, :])
+                          - torch.maximum(bl[:, None], xL[None, :])).clamp(min=0.0)
+                    oy_c = (torch.minimum(bt[:, None], yR[None, :])
+                          - torch.maximum(bb[:, None], yL[None, :])).clamp(min=0.0)
+                    rho = (ox_c.transpose(0, 1) @ oy_c) * inv_bin
+                    rho = rho - rho.mean()
+                    a_hat = Cb @ rho @ Cb.transpose(0, 1)
+                    den_curr = (a_hat * a_hat / denom).sum()
+                    
+                wall_curr = ecx_curr.new_zeros(())
+                if lam_wall > 0.0:
+                    wall_curr = (torch.relu(0.5 * w_curr - ecx_curr) ** 2
+                            + torch.relu(0.5 * h_curr - ecy_curr) ** 2).sum() / N
+                wall_lin_curr = ecx_curr.new_zeros(())
+                if lam_wall_lin > 0.0:
+                    wall_lin_curr = (torch.relu(0.5 * w_curr - ecx_curr)
+                                + torch.relu(0.5 * h_curr - ecy_curr)).sum() / N
+                                
+                grp_curr = ecx_curr.new_zeros(())
+                if Gc > 0:
+                    gcx = Mc @ ecx_curr
+                    gcy = Mc @ ecy_curr
+                    if grouping_l2:
+                        grp_curr = (((ecx_curr[has_clust] - gcx[gi]).pow(2)
+                                + (ecy_curr[has_clust] - gcy[gi]).pow(2)).sum()) / n_clust_mem
+                    else:
+                        grp_curr = (((ecx_curr[has_clust] - gcx[gi]).abs()
+                                + (ecy_curr[has_clust] - gcy[gi]).abs()).sum()) / n_clust_mem
+                                
+                bnd_curr = ecx_curr.new_zeros(())
+                xmn_c, xmx_c = left_c.detach(), right_c.detach()
+                ymn_c, ymx_c = bot_c.detach(), top_c.detach()
+                if boundary_l2:
+                    if Lb.any(): bnd_curr = bnd_curr + ((ecx_curr[Lb] - 0.5 * w_curr[Lb]) - xmn_c).pow(2).sum()
+                    if Rb.any(): bnd_curr = bnd_curr + ((ecx_curr[Rb] + 0.5 * w_curr[Rb]) - xmx_c).pow(2).sum()
+                    if Tb.any(): bnd_curr = bnd_curr + ((ecy_curr[Tb] + 0.5 * h_curr[Tb]) - ymx_c).pow(2).sum()
+                    if Bb.any(): bnd_curr = bnd_curr + ((ecy_curr[Bb] - 0.5 * h_curr[Bb]) - ymn_c).pow(2).sum()
+                else:
+                    if Lb.any(): bnd_curr = bnd_curr + ((ecx_curr[Lb] - 0.5 * w_curr[Lb]) - xmn_c).abs().sum()
+                    if Rb.any(): bnd_curr = bnd_curr + ((ecx_curr[Rb] + 0.5 * w_curr[Rb]) - xmx_c).abs().sum()
+                    if Tb.any(): bnd_curr = bnd_curr + ((ecy_curr[Tb] + 0.5 * h_curr[Tb]) - ymx_c).abs().sum()
+                    if Bb.any(): bnd_curr = bnd_curr + ((ecy_curr[Bb] - 0.5 * h_curr[Bb]) - ymn_c).abs().sum()
+                bnd_curr = bnd_curr / N
+                
+                mib_shape_curr = ecx_curr.new_zeros(())
+                if has_anchor.any():
+                    mib_shape_curr = ((la - la_target) ** 2)[has_anchor].sum()
+                    
+                loss_curr = wl_curr + lam_ov * ov_curr + lam_bb * bbox_curr + lam_grp * grp_curr + lam_bnd * bnd_curr + lam_out * out_curr
+                if lam_mib_shape > 0.0:
+                    loss_curr = loss_curr + (lam_mib_shape * (0.2 + 1.6 * frac)) * mib_shape_curr
+                if edensity > 0.0:
+                    loss_curr = loss_curr + edensity * den_curr
+                if lam_wall > 0.0:
+                    loss_curr = loss_curr + (lam_wall * frac) * wall_curr
+                if lam_wall_lin > 0.0:
+                    loss_curr = loss_curr + lam_wall_lin * wall_lin_curr
+                    
+                loss_curr.backward()
+                return loss_curr
+                
+            opt_lbfgs.step(evaluate_loss_closure)
+        else:
+            opt.step()
+
+
+        # Checkpoint coordinates and optimizer state every 50 iterations
+        if enable_rollback and it % 50 == 0:
+            import copy
+            last_checkpoint = (
+                cx.data.clone(), 
+                cy.data.clone(), 
+                la.data.clone(), 
+                copy.deepcopy(opt.state_dict())
+            )
+            
+        ov_history.append(float(ov.item()))
+        
+        # Stagnation check and rollback trigger at the end of every 50-iter window
+        if enable_rollback and it > 0 and it % 50 == 49 and rollback_count < 2:
+            if len(ov_history) >= 100:
+                mean_current = sum(ov_history[-50:]) / 50.0
+                mean_prev = sum(ov_history[-100:-50]) / 50.0
+                # Stagnation criterion: overlap reduction < 0.5%
+                # and substantial remaining overlap (> 1% of total block area)
+                tot_area = float(an.sum().item())
+                if mean_current >= 0.995 * mean_prev and mean_current > 0.01 * tot_area:
+                    with torch.no_grad():
+                        cx.data.copy_(last_checkpoint[0])
+                        cy.data.copy_(last_checkpoint[1])
+                        la.data.copy_(last_checkpoint[2])
+                        opt.load_state_dict(copy.deepcopy(last_checkpoint[3]))
+                        # Inject entropy (noise) proportional to canvas size
+                        w_canvas = float(Wc) if (edensity > 0.0) else 1.0
+                        h_canvas = float(Hc) if (edensity > 0.0) else 1.0
+                        cx.data.add_(torch.randn_like(cx) * 0.01 * w_canvas)
+                        cy.data.add_(torch.randn_like(cy) * 0.01 * h_canvas)
+                        rollback_count += 1
+                        print(f"[debug-rollback] Case rollback triggered at iter {it}! Count: {rollback_count}")
+                        # Clear history for this window to prevent immediate re-trigger
+                        ov_history = []
 
         if clamp_canvas and frac >= clamp_start:  # confine to the first quadrant
             with torch.no_grad():
@@ -425,6 +691,8 @@ def place(
                 cy.data.copy_(torch.clamp(cy.data, loy, hiy))
 
     with torch.no_grad():
+        if has_anchor.any():
+            la.data.copy_(torch.where(has_anchor, la_target, la.data))
         w, h = shapes(la)
         ecx = torch.where(is_pre, pre_cx, cx)
         ecy = torch.where(is_pre, pre_cy, cy)
@@ -451,6 +719,14 @@ def place(
                         ia if eb is not None else None, ib if eb is not None else None,
                         wb if eb is not None else None,
                         ebk if ep is not None else None, wp if ep is not None else None, a)
+        diag["loss_history"] = loss_history
+        needs_ext = False
+        if len(loss_history) >= 50:
+            rel_dec = (loss_history[-50] - loss_history[-1]) / max(1e-9, abs(loss_history[-50]))
+            thresh = float(os.environ.get("ELECTRO_ADAPTIVE_THRESH", "0.005"))
+            if abs(rel_dec) > thresh:
+                needs_ext = True
+        diag["needs_extension"] = needs_ext
     return out, diag
 
 

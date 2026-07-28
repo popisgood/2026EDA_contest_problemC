@@ -3,7 +3,7 @@ set -e
 SUB=/home/pop/2026_EDA_contest/submit/electro_submission
 SRC=/home/pop/2026_EDA_contest/electro
 cp "$SRC/electro_optimizer.py" "$SRC/analytical_place.py" "$SRC/legalize.py" \
-   "$SRC/soft_repair.py" "$SRC/electro_parallel.py" "$SUB/"
+   "$SRC/soft_repair.py" "$SRC/electro_parallel.py" "$SRC/shape_compact.py" "$SUB/"
 rm -rf "$SUB/__pycache__"
 echo "=== files in package ==="; ls -la "$SUB"
 echo "=== re-audit absolute paths in package ==="
