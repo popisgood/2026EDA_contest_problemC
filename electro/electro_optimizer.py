@@ -25,6 +25,42 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+def _physical_core_count() -> int:
+    """Number of PHYSICAL CPU cores -- we run one single-threaded multi-start
+    seed per physical core.  Hyperthreads share a core's execution units, so
+    launching a compute-bound seed on every *logical* core oversubscribes and
+    runs SLOWER for this workload (measured on the C++ B*-tree solver: 16
+    chains were slower than 8 on an 8-physical/16-logical box; the same
+    oversubscription risk applies here).  Parse /proc/cpuinfo topology; fall
+    back to the affinity-limited logical count, then os.cpu_count()."""
+    try:
+        pairs = set()
+        phys = core = None
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    if phys is not None and core is not None:
+                        pairs.add((phys, core))
+                    phys = core = None
+                    continue
+                if s.startswith("physical id"):
+                    phys = s.split(":", 1)[1].strip()
+                elif s.startswith("core id"):
+                    core = s.split(":", 1)[1].strip()
+        if phys is not None and core is not None:
+            pairs.add((phys, core))
+        if pairs:
+            return max(1, len(pairs))
+    except Exception:
+        pass
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 8)
+
+
 # --- SUBMISSION DEFAULT: first-quadrant containment ------------------------
 # The contest harness imports this module and calls solve() with no env vars.
 # We want the SUBMITTED behaviour to keep every block in the first quadrant
@@ -134,20 +170,27 @@ class MyOptimizer(FloorplanOptimizer):
         # snapped off their cluster.  Iterating lets them settle: full-100 score
         # 3.733 (1 round) -> 3.568 (2) -> 3.545 (3) -> 3.545 (4, saturated).
         self.repair_rounds = int(os.environ.get("ELECTRO_REPAIR_ROUNDS", "3"))
-        # Multi-start: keep the best of N seeds.  More seeds -> lower quality score
-        # (subset 1->2.54, 3->2.16, 8->2.07 with ML) but ~Nx runtime.  The contest
-        # runtime penalty (R^0.3, UNCAPPED on the slow side) usually makes seeds=1
-        # win the runtime-adjusted total unless the field's median runtime is very
-        # high.  Default 1 (fast); raise it when runtime is cheap / median is high.
-        # Default 8 (2026-07-28): multi-start diversity turned out to be worth more
-        # than any single-start refinement we had.  Measured full-100: an 8-seed
-        # parallel multi-start scored 1.9025 @ 3.84s/case where our best
-        # single-start pipeline (Jacobi + hedge + repair cascade) got 1.9683 @
-        # 5.50s -- better on BOTH axes.  The cases it wins are exactly the ones a
-        # single clever init loses: tid6 1.89 vs our 2.46, tid60 1.85 vs our 2.17,
-        # i.e. the bad-basin cases the hedge fallback was built for and only
-        # partially fixed.  8 independent basins simply covers them.
-        self.seeds = int(os.environ.get("ELECTRO_SEEDS", "8"))
+        # Multi-start: keep the best of N seeds, run in parallel (see
+        # ELECTRO_PARALLEL below) so more seeds cost ~1 seed of wall-clock, not
+        # Nx.  Multi-start diversity is worth more than any single-start
+        # refinement we tried: an 8-seed parallel multi-start scored 1.9025
+        # @ 3.84s/case where our best single-start pipeline (Jacobi + hedge +
+        # repair cascade) got 1.9683 @ 5.50s -- better on BOTH axes.  The cases
+        # it wins are exactly the ones a single clever init loses: tid6 1.89 vs
+        # 2.46, tid60 1.85 vs 2.17, i.e. the bad-basin cases a single Jacobi
+        # start (even with a short hedge fallback) still lost -- 8 independent
+        # basins simply covers them.
+        #
+        # Default = physical core count: the evaluation machine is dedicated
+        # exclusively to this submission (per the contest's Beta guidelines),
+        # so there is no reason to leave cores idle.  Since the persistent pool
+        # runs one single-threaded worker per seed, seeds==physical-cores keeps
+        # every core doing useful work with no hyperthread oversubscription.
+        # This scales automatically to whatever machine actually runs it: 8
+        # seeds on this dev box's 8 physical cores, up to the eval machine's
+        # full physical core count there.  Override with ELECTRO_SEEDS=N to
+        # pin a specific count.
+        self.seeds = int(os.environ.get("ELECTRO_SEEDS", str(_physical_core_count())))
         # Multi-start seeds in parallel fork processes.  ON by default now: with a
         # PERSISTENT pool (see _get_pool) the fork happens once per evaluation
         # rather than once per case, so N seeds cost ~1 seed of wall-clock on an
